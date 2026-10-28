@@ -1,0 +1,12 @@
+[package]
+name = "timestamp_core"
+version = "0.1.0"
+edition = "2021"
+description = "Unix timestamp and date/time conversion engine (port of Swift TimestampCore)"
+
+[lib]
+name = "timestamp_core"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = "0.4"

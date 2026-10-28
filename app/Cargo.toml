@@ -1,0 +1,33 @@
+[package]
+name = "devutil"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "DevUtil workbench on Native Shell (NSH 0.1.1, AppKit on macOS)"
+license = "MIT"
+
+[lib]
+name = "devutil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "devutil"
+path = "src/main.rs"
+
+[dependencies]
+nsh-core = "0.1.1"
+json_core = { path = "../crates/json_core" }
+timestamp_core = { path = "../crates/timestamp_core" }
+url_codec_core = { path = "../crates/url_codec_core" }
+hash_core = { path = "../crates/hash_core" }
+rfd = "0.15"
+env_logger = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "0.1.1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.1.1", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { version = "0.1.1", default-features = false }

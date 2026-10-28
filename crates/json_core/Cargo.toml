@@ -1,0 +1,9 @@
+[package]
+name = "json_core"
+version = "0.1.0"
+edition = "2021"
+description = "Ordered JSON AST, strict parser, recovery, and analysis engine (port of Swift JSONCore)"
+
+[lib]
+name = "json_core"
+path = "src/lib.rs"

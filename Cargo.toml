@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/json_core",
+    "crates/timestamp_core",
+    "crates/url_codec_core",
+    "crates/hash_core",
+    "app",
+]

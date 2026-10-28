@@ -1,0 +1,250 @@
+//! DevUtil workbench on Native Shell 0.1.1.
+//!
+//! The tools call `json_core`, `timestamp_core`, `url_codec_core`, and
+//! `hash_core` directly. `App.tsx` mounts this same `App` when `nsh run`
+//! hosts the TSX entry.
+
+mod chrome;
+mod hash_model;
+mod hash_tool;
+mod json_model;
+mod json_tool;
+mod timestamp_model;
+mod timestamp_tool;
+mod url_model;
+mod url_tool;
+
+use hash_tool::HashState;
+use json_tool::JsonState;
+use nsh_core::keymap::When;
+use nsh_core::ui::prelude::*;
+use timestamp_tool::TimestampState;
+use url_tool::UrlState;
+
+/// Light and dark palettes, loaded from `theme.json`.
+pub fn app_theme() -> Theme {
+    Theme::from_json(include_str!("theme.json")).expect("DevUtil theme")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tool {
+    Json,
+    Timestamp,
+    Url,
+    Hash,
+}
+
+/// The components the TSX entry imports from `app/native`.
+#[native_module("app/native")]
+fn native(registry: &mut Registry) {
+    registry.register::<App>();
+}
+
+/// One window, four local tools. ⌘↩ (and Ctrl+Enter) runs the visible tool.
+/// Appearance follows the system; `theme.json` has a light and a dark palette.
+#[component]
+pub fn App() -> impl IntoElement {
+    let tool = signal(Tool::Json);
+    let copied: Signal<Option<String>> = signal(None);
+    let json = JsonState::new();
+    load_dev_json(json);
+    let timestamp = TimestampState::new();
+    let url = UrlState::new();
+    let hash = HashState::new();
+    load_dev_hash(hash);
+    match std::env::var("DEVUTIL_TOOL").ok().as_deref() {
+        Some("timestamp") => tool.set(Tool::Timestamp),
+        Some("url") => tool.set(Tool::Url),
+        Some("hash") => tool.set(Tool::Hash),
+        _ => {}
+    }
+    let shortcut = key_label("mod+enter");
+
+    // Bound once. Each page stays mounted, so a binding inside a page would
+    // be overwritten by whichever page registered last.
+    bind_convert("mod+enter", tool, json, timestamp, url, hash);
+    bind_convert("ctrl+enter", tool, json, timestamp, url, hash);
+
+    // `flex_1` is what makes this host fill the window. A percentage height
+    // does not: the root's child otherwise stays as tall as its content.
+    view()
+        .flex_1()
+        .flex_row()
+        .bg(move || theme().background)
+        .text_color(move || theme().foreground)
+        .child(sidebar(tool, copied, shortcut.clone()))
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .flex_col()
+                .child(pages(tool, json, timestamp, url, hash, copied, shortcut)),
+        )
+}
+
+/// `DEVUTIL_HASH_FILE=/path` hashes that file on startup, in the file mode.
+fn load_dev_hash(hash: HashState) {
+    let Ok(path) = std::env::var("DEVUTIL_HASH_FILE") else {
+        return;
+    };
+    hash.open_path(path);
+}
+
+/// `DEVUTIL_JSON=/path/to/file.json` loads that document into the JSON tool.
+/// `DEVUTIL_ANALYZE=1` analyzes it on startup. Used to measure large files.
+fn load_dev_json(json: JsonState) {
+    let Ok(path) = std::env::var("DEVUTIL_JSON") else {
+        return;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let bytes = text.len();
+            json.publish_source(text);
+            if std::env::var("DEVUTIL_ANALYZE").ok().as_deref() == Some("1") {
+                let started = std::time::Instant::now();
+                json.analyze(json_model::OutputMode::Pretty);
+                eprintln!("DEVUTIL_ANALYZE {bytes} bytes in {:?}", started.elapsed());
+            }
+        }
+        Err(err) => eprintln!("DEVUTIL_JSON {path}: {err}"),
+    }
+}
+
+fn bind_convert(
+    keystroke: &str,
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+) {
+    on_key_with(
+        keystroke,
+        KeyOptions {
+            when: When::Always,
+            repeat: false,
+        },
+        move |_| match tool.get() {
+            Tool::Json => json.analyze(json_model::OutputMode::Pretty),
+            Tool::Timestamp => timestamp.convert(),
+            Tool::Url => url.convert(),
+            Tool::Hash => hash.run(),
+        },
+    );
+}
+
+fn select_tool(tool: Signal<Tool>, copied: Signal<Option<String>>, next: Tool) {
+    copied.set(None);
+    tool.set(next);
+}
+
+fn sidebar(tool: Signal<Tool>, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
+    view()
+        .flex_none()
+        .w(px(200.0))
+        .h_full()
+        .flex_col()
+        .gap(px(4.0))
+        .p(px(12.0))
+        .bg(move || theme().accent)
+        .border_r_1()
+        .border_color(move || theme().border)
+        .child(
+            view()
+                .gap(px(2.0))
+                .px(px(8.0))
+                .pt(px(8.0))
+                .pb(px(12.0))
+                .child(
+                    text("DevUtil")
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || theme().foreground),
+                )
+                .child(chrome::hint("Local developer tools")),
+        )
+        .child(chrome::nav_item("{ }", "JSON", tool, Tool::Json, move |next| {
+            select_tool(tool, copied, next)
+        }))
+        .child(chrome::nav_item(
+            "◷",
+            "Timestamp",
+            tool,
+            Tool::Timestamp,
+            move |next| select_tool(tool, copied, next),
+        ))
+        .child(chrome::nav_item("↗", "URL", tool, Tool::Url, move |next| {
+            select_tool(tool, copied, next)
+        }))
+        .child(chrome::nav_item("#", "Hash", tool, Tool::Hash, move |next| {
+            select_tool(tool, copied, next)
+        }))
+        .child(view().flex_1())
+        .child(
+            text(move || format!("{shortcut} runs this tool"))
+                .text_xs()
+                .px(px(8.0))
+                .pb(px(8.0))
+                .text_color(move || theme().muted_foreground),
+        )
+}
+
+fn pages(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+    copied: Signal<Option<String>>,
+    shortcut: String,
+) -> impl IntoElement {
+    let timestamp_shortcut = shortcut.clone();
+    let url_shortcut = shortcut.clone();
+    let hash_shortcut = shortcut.clone();
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .child(page(
+            move || tool.get() == Tool::Json,
+            json_tool::body(json, copied, shortcut),
+        ))
+        .child(page(
+            move || tool.get() == Tool::Timestamp,
+            timestamp_tool::body(timestamp, copied, timestamp_shortcut),
+        ))
+        .child(page(
+            move || tool.get() == Tool::Url,
+            url_tool::body(url, copied, url_shortcut),
+        ))
+        .child(page(
+            move || tool.get() == Tool::Hash,
+            hash_tool::body(hash, copied, hash_shortcut),
+        ))
+}
+
+/// Hidden tools stay mounted, so their fields and results survive a tab
+/// change, and `display: none` keeps them from sharing the column.
+fn page(
+    active: impl Fn() -> bool + 'static,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .style_when(move || !active(), |style| style.hidden())
+        .child(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_file_loads() {
+        let theme = app_theme();
+        assert_eq!(theme.radius, 12.0);
+        assert_ne!(theme.background.light, theme.background.dark);
+        assert_ne!(theme.foreground.light, theme.foreground.dark);
+    }
+}

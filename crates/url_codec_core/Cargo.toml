@@ -1,0 +1,9 @@
+[package]
+name = "url_codec_core"
+version = "0.1.0"
+edition = "2021"
+description = "URL percent-encode/decode engine (application/x-www-form-urlencoded)"
+
+[lib]
+name = "url_codec_core"
+path = "src/lib.rs"
