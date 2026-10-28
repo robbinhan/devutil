@@ -550,6 +550,7 @@ dependencies = [
  "nsh-platform-linux",
  "nsh-platform-macos",
  "nsh-platform-windows",
+ "regex",
  "rfd",
  "timestamp_core",
  "url_codec_core",

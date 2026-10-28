@@ -3,6 +3,8 @@
 use timestamp_core::{TimestampEngine, TimestampUnit};
 
 use crate::chrome::{self, column_pane};
+use crate::find::TextSearch;
+use crate::search_ui;
 use crate::timestamp_model::{self, DisplayZone, Tone};
 use nsh_core::ui::prelude::*;
 
@@ -19,6 +21,7 @@ pub struct TimestampState {
     pub zone: Signal<DisplayZone>,
     pub analysis: Signal<Option<timestamp_core::TimestampAnalysis>>,
     pub analysis_zone: Signal<Option<DisplayZone>>,
+    pub search: TextSearch,
 }
 
 impl TimestampState {
@@ -29,7 +32,12 @@ impl TimestampState {
             zone: signal(DisplayZone::Local),
             analysis: signal(None),
             analysis_zone: signal(None),
+            search: TextSearch::new(),
         }
+    }
+
+    pub fn schedule_search(self) {
+        self.search.schedule(move || self.source.get());
     }
 
     pub fn convert(self) {
@@ -67,14 +75,36 @@ pub fn body(
     shortcut: String,
 ) -> impl IntoElement {
     let header_shortcut = shortcut.clone();
+    let editor = element_ref();
+    let query_ref = element_ref();
+    search_ui::watch_focus(state.search, query_ref.clone());
+    search_ui::watch_plain_field(state.search, state.source, editor.clone());
     view()
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .child(page_header(state, header_shortcut))
+        .child(dynamic(move || {
+            if !state.search.open.get() {
+                return view().into_element();
+            }
+            search_ui::bar(
+                state.search,
+                &query_ref,
+                move |text| {
+                    state.search.query.set(text);
+                    state.schedule_search();
+                },
+                move || state.schedule_search(),
+                move || state.search.step(-1),
+                move || state.search.step(1),
+                view(),
+            )
+            .into_element()
+        }))
         .child(
             chrome::workbench()
-                .child(input_pane(state, shortcut))
+                .child(input_pane(state, shortcut, editor))
                 .child(result_pane(state, copied)),
         )
 }
@@ -109,7 +139,7 @@ fn page_header(state: TimestampState, shortcut: String) -> impl IntoElement {
         }))
 }
 
-fn input_pane(state: TimestampState, _shortcut: String) -> impl IntoElement {
+fn input_pane(state: TimestampState, _shortcut: String, editor: ElementRef) -> impl IntoElement {
     let source = state.source;
     column_pane()
         .child(header(source))
@@ -117,8 +147,14 @@ fn input_pane(state: TimestampState, _shortcut: String) -> impl IntoElement {
         .child(zone_row(state))
         .child(status_line(state))
         .child(
-            chrome::mono_field(source, "1700000000", true, true, move |text| source.set(text))
-                .test_id("timestamp-input")
+            chrome::mono_field(source, "1700000000", true, true, move |text| {
+                source.set(text);
+                if state.search.open.get() {
+                    state.schedule_search();
+                }
+            })
+            .element_ref(&editor)
+            .test_id("timestamp-input")
                 .flex_1()
                 .min_h(px(120.0)),
         )

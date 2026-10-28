@@ -14,8 +14,10 @@ use std::time::Duration;
 use hash_core::{self, DigestRow};
 
 use crate::chrome::{self, column_pane};
+use crate::find::TextSearch;
 use crate::hash_model::{self, InputMode, StatusLine, Tone, DEBOUNCE};
-use crate::json_model;
+use crate::json_model::{self, field_text, reveal_match};
+use crate::search_ui;
 use nsh_core::ui::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -41,6 +43,9 @@ pub struct HashState {
     pub file_done: Signal<u64>,
     pub file_busy: Signal<bool>,
     pub file_error: Signal<String>,
+    pub search: TextSearch,
+    pub field_origin: Signal<usize>,
+    pub field_line: Signal<u32>,
 }
 
 impl HashState {
@@ -69,17 +74,45 @@ impl HashState {
             file_done: signal(0),
             file_busy: signal(false),
             file_error: signal(String::new()),
+            search: TextSearch::new(),
+            field_origin: signal(0),
+            field_line: signal(0),
         }
     }
 
     pub fn publish_source(self, text: String, rehash: bool) {
         let shown = hash_model::displayed_input(&text);
+        self.field_origin.set(0);
+        self.field_line.set(0);
         self.field_capped.set(shown.capped);
         self.field.set(shown.text);
         self.source.set(text);
         if rehash {
             self.schedule_text();
         }
+        if self.search.open.get() {
+            self.schedule_search();
+        }
+    }
+
+    pub fn schedule_search(self) {
+        if self.mode.get() != InputMode::Text {
+        self.search.clear_hits();
+        self.search
+            .label
+            .set("Switch to Text to search. File mode hashes bytes, not this field.".to_string());
+        return;
+        }
+        self.search.schedule(move || self.source.get());
+    }
+
+    pub fn close_search(self) {
+        self.search.open.set(false);
+        let shown = self.source.with(|text| field_text(text));
+        self.field_origin.set(0);
+        self.field_line.set(0);
+        self.field_capped.set(shown.capped);
+        self.field.set(shown.text);
     }
 
     /// A keystroke in the field. The view never holds more than the preview.
@@ -87,17 +120,29 @@ impl HashState {
         if self.field.with(|current| current == &text) {
             return;
         }
+        let origin = self.field_origin.get();
         let capped = self.field_capped.get();
         let preview = self.field.get();
-        if capped && is_preview_edit(&preview, &text) {
+        if (capped || origin > 0) && is_preview_edit(&preview, &text) {
             self.field.update(|_| {});
             return;
         }
-        if json_model::utf16_len(&text) + 8 >= json_model::FIELD_LIMIT {
+        if origin == 0 && json_model::utf16_len(&text) + 8 >= json_model::FIELD_LIMIT {
             self.recover_clipboard(text);
             return;
         }
-        self.publish_source(text, true);
+        if origin == 0 {
+            self.publish_source(text, true);
+            return;
+        }
+        let Some(spliced) = self
+            .source
+            .with(|source| json_model::splice_window(source, origin, preview.len(), &text))
+        else {
+            self.field.update(|_| {});
+            return;
+        };
+        self.publish_source(spliced, true);
     }
 
     fn recover_clipboard(self, clipped: String) {
@@ -133,6 +178,9 @@ impl HashState {
         }
         self.mode.set(mode);
         self.ensure_current();
+        if self.search.open.get() {
+            self.schedule_search();
+        }
     }
 
     pub fn set_hmac(self, on: bool) {
@@ -370,14 +418,55 @@ fn take_cancel_token() -> Arc<AtomicBool> {
 
 pub fn body(state: HashState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
     let header_shortcut = shortcut.clone();
+    let editor = element_ref();
+    let query_ref = element_ref();
+    search_ui::watch_focus(state.search, query_ref.clone());
+    let field_editor = editor.clone();
+    effect(move || {
+        let revision = state.search.revision.get();
+        let _ = state.search.index.get();
+        untracked(|| {
+            if revision == 0 || !state.search.open.get() || state.mode.get() != InputMode::Text {
+                return;
+            }
+            let Some(hit) = state.search.current() else {
+                return;
+            };
+            let full = state.source.get();
+            let revealed = reveal_match(&full, hit.start, hit.end);
+            state.field_origin.set(revealed.preview.byte_start);
+            state.field_line.set(revealed.line);
+            state.field_capped.set(revealed.preview.capped);
+            state.field.set(revealed.preview.text);
+            search_ui::select_later(field_editor.clone(), revealed.utf16_start, revealed.utf16_end);
+        });
+    });
     view()
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .child(page_header(state, header_shortcut))
+        .child(dynamic(move || {
+            if !state.search.open.get() {
+                return view().into_element();
+            }
+            search_ui::bar(
+                state.search,
+                &query_ref,
+                move |text| {
+                    state.search.query.set(text);
+                    state.schedule_search();
+                },
+                move || state.schedule_search(),
+                move || state.search.step(-1),
+                move || state.search.step(1),
+                view(),
+            )
+            .into_element()
+        }))
         .child(
             chrome::workbench()
-                .child(input_pane(state))
+                .child(input_pane(state, editor))
                 .child(result_pane(state, copied)),
         )
 }
@@ -413,7 +502,7 @@ fn page_header(state: HashState, shortcut: String) -> impl IntoElement {
         .child(chrome::action_button("Hash", "hash-run", true, move || state.run()))
 }
 
-fn input_pane(state: HashState) -> impl IntoElement {
+fn input_pane(state: HashState, editor: ElementRef) -> impl IntoElement {
     column_pane()
         .child(header(state))
         .child(mode_row(state))
@@ -427,7 +516,7 @@ fn input_pane(state: HashState) -> impl IntoElement {
         .child(cap_note(state))
         .child(If::new(
             move || state.mode.get() == InputMode::Text,
-            move || text_field(state),
+            move || text_field(state, editor.clone()),
         ))
         .child(If::new(
             move || state.mode.get() == InputMode::File,
@@ -485,6 +574,16 @@ fn mode_row(state: HashState) -> impl IntoElement {
 
 fn cap_note(state: HashState) -> impl IntoElement {
     dynamic(move || {
+        if state.field_origin.get() > 0 {
+            let message = state
+                .source
+                .with(|full| json_model::window_message(full.len(), state.field_line.get()));
+            return view().child(
+                text(message)
+                    .text_xs()
+                    .text_color(move || theme().warning),
+            );
+        }
         if state.mode.get() != InputMode::Text || !state.field_capped.get() {
             return view();
         }
@@ -501,11 +600,12 @@ fn cap_note(state: HashState) -> impl IntoElement {
     })
 }
 
-fn text_field(state: HashState) -> impl IntoElement {
+fn text_field(state: HashState, editor: ElementRef) -> impl IntoElement {
     let field = state.field;
     chrome::mono_field(field, hash_model::SAMPLE, true, true, move |text| {
         state.on_field(text)
     })
+    .element_ref(&editor)
     .test_id("hash-input")
     .flex_1()
     .min_h(px(120.0))

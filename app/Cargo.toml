@@ -22,6 +22,7 @@ url_codec_core = { path = "../crates/url_codec_core" }
 hash_core = { path = "../crates/hash_core" }
 rfd = "0.15"
 env_logger = "0.11"
+regex = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.1.1", default-features = false }

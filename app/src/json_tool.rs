@@ -5,12 +5,22 @@ use std::rc::Rc;
 use json_core::{AnalysisEngine, AnalysisResult, Diagnostic, Disposition, SourceRange};
 
 use crate::chrome::{self, column_pane};
+use crate::find::{self, TextSearch};
+use crate::search_ui;
 
 const SAMPLE: &str = "{\n  \"ok\": true,\n  \"name\": \"DevUtil\",\n  \"count\": 3\n}";
 use crate::json_model::{
-    self, OutputMode, TreeRow, cap_message, field_text, output_text, severity_name, tree_rows,
+    self, OutputMode, TreeRow, cap_message, field_text, filtered_tree_rows, output_text,
+    reveal_match, severity_name, tree_rows, window_message,
 };
 use nsh_core::ui::prelude::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindTarget {
+    Input,
+    Result,
+    Tree,
+}
 use nsh_core::EllipsizeMode;
 
 #[derive(Clone, Copy)]
@@ -31,6 +41,15 @@ pub struct JsonState {
     pub expanded: Signal<Vec<String>>,
     pub tree_open: Signal<bool>,
     pub steps_open: Signal<bool>,
+    pub search: TextSearch,
+    pub find_target: Signal<FindTarget>,
+    pub field_origin: Signal<usize>,
+    pub field_line: Signal<u32>,
+    pub output_origin: Signal<usize>,
+    pub output_line: Signal<u32>,
+    /// `None` shows the normal tree. `Some` is the filtered tree, possibly empty.
+    pub filtered_tree: Signal<Option<Vec<TreeRow>>>,
+    pub tree_cursor: Signal<usize>,
 }
 
 impl JsonState {
@@ -48,14 +67,112 @@ impl JsonState {
             expanded: signal(vec!["root".to_string()]),
             tree_open: signal(true),
             steps_open: signal(true),
+            search: TextSearch::new(),
+            find_target: signal(FindTarget::Input),
+            field_origin: signal(0),
+            field_line: signal(0),
+            output_origin: signal(0),
+            output_line: signal(0),
+            filtered_tree: signal(None),
+            tree_cursor: signal(0),
         }
     }
 
     pub fn publish_source(self, text: String) {
         let shown = field_text(&text);
+        self.field_origin.set(0);
+        self.field_line.set(0);
         self.field_capped.set(shown.capped);
         self.field.set(shown.text);
         self.source.set(text);
+        if self.search.open.get() {
+            self.schedule_search();
+        }
+    }
+
+    pub fn schedule_search(self) {
+        let target = self.find_target;
+        self.search.schedule(move || match target.get() {
+            FindTarget::Result => self.formatted.get(),
+            FindTarget::Input | FindTarget::Tree => self.source.get(),
+        });
+    }
+
+    pub fn close_search(self) {
+        self.search.open.set(false);
+        self.restore_input();
+        self.restore_output();
+        self.filtered_tree.set(None);
+    }
+
+    pub fn step_tree(self, delta: isize) {
+        let next = self.filtered_tree.with(|rows| {
+            let Some(rows) = rows else {
+                return 0;
+            };
+            let matches = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.matched)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                return 0;
+            }
+            let pos = matches
+                .iter()
+                .position(|index| *index == self.tree_cursor.get())
+                .unwrap_or(0);
+            let next = (pos as isize + delta).rem_euclid(matches.len() as isize) as usize;
+            matches[next]
+        });
+        self.tree_cursor.set(next);
+        self.publish_find_label();
+    }
+
+    fn restore_input(self) {
+        let shown = self.source.with(|text| field_text(text));
+        self.field_origin.set(0);
+        self.field_line.set(0);
+        self.field_capped.set(shown.capped);
+        self.field.set(shown.text);
+    }
+
+    fn restore_output(self) {
+        let shown = self.formatted.with(|text| field_text(text));
+        self.output_origin.set(0);
+        self.output_line.set(0);
+        self.output_capped.set(!self.formatted.with(String::is_empty) && shown.capped);
+        self.output_field.set(shown.text);
+    }
+
+    fn publish_find_label(self) {
+        if self.find_target.get() != FindTarget::Tree {
+            self.search.publish_label();
+            return;
+        }
+        let (index, total) = self.filtered_tree.with(|rows| {
+            let Some(rows) = rows else {
+                return (0, 0);
+            };
+            let matches = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.matched)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let pos = matches
+                .iter()
+                .position(|index| *index == self.tree_cursor.get())
+                .unwrap_or(0);
+            (pos, matches.len())
+        });
+        let label = self.search.query.with(|query| {
+            self.search.error.with(|error| {
+                find::status_label(query.is_empty(), false, error, index, total, false)
+            })
+        });
+        self.search.label.set(label);
     }
 
     /// A keystroke in the field. The view never holds more than the preview,
@@ -64,18 +181,30 @@ impl JsonState {
         if self.field.with(|current| current == &text) {
             return;
         }
+        let origin = self.field_origin.get();
         let capped = self.field_capped.get();
         let preview = self.field.get();
-        if capped && is_preview_edit(&preview, &text) {
+        if (capped || origin > 0) && is_preview_edit(&preview, &text) {
             // Put the preview back. The full document stays in `source`.
             self.field.update(|_| {});
             return;
         }
-        if json_model::utf16_len(&text) + 8 >= json_model::FIELD_LIMIT {
+        if origin == 0 && json_model::utf16_len(&text) + 8 >= json_model::FIELD_LIMIT {
             self.recover_clipboard(text);
             return;
         }
-        self.publish_source(text);
+        if origin == 0 {
+            self.publish_source(text);
+            return;
+        }
+        let Some(spliced) = self
+            .source
+            .with(|source| json_model::splice_window(source, origin, preview.len(), &text))
+        else {
+            self.field.update(|_| {});
+            return;
+        };
+        self.publish_source(spliced);
     }
 
     fn recover_clipboard(self, clipped: String) {
@@ -118,15 +247,25 @@ impl JsonState {
         let Some(full) = text else {
             self.formatted.set(String::new());
             self.output_field.set(String::new());
+            self.output_origin.set(0);
+            self.output_line.set(0);
             self.output_capped.set(false);
             self.has_output.set(false);
+            if self.search.open.get() {
+                self.schedule_search();
+            }
             return;
         };
         let shown = field_text(&full);
+        self.output_origin.set(0);
+        self.output_line.set(0);
         self.formatted.set(full);
         self.output_field.set(shown.text);
         self.output_capped.set(shown.capped);
         self.has_output.set(true);
+        if self.search.open.get() {
+            self.schedule_search();
+        }
     }
 
     pub fn use_sample(self) {
@@ -142,6 +281,7 @@ impl JsonState {
         self.expanded.set(vec!["root".to_string()]);
         self.tree_open.set(true);
         self.steps_open.set(true);
+        self.filtered_tree.set(None);
     }
 
     pub fn paste(self) {
@@ -203,18 +343,180 @@ pub fn toolbar_buttons(state: JsonState, copied: Signal<Option<String>>) -> impl
 
 pub fn body(state: JsonState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
     let editor = element_ref();
+    let output_editor = element_ref();
+    let tree_list = element_ref();
+    let query_ref = element_ref();
+    install_search(state, editor.clone(), output_editor.clone(), tree_list.clone(), query_ref.clone());
     let panes_shortcut = shortcut.clone();
+    let bar_state = state;
     view()
         .flex_1()
         .h_full()
         .min_h(px(0.0))
         .flex_col()
         .child(page_header(state, copied, shortcut))
+        .child(dynamic(move || {
+            if !bar_state.search.open.get() {
+                return view().into_element();
+            }
+            let state = bar_state;
+            search_ui::bar(
+                state.search,
+                &query_ref,
+                move |text| {
+                    state.search.query.set(text);
+                    state.schedule_search();
+                },
+                move || state.schedule_search(),
+                move || step_json(state, -1),
+                move || step_json(state, 1),
+                find_target_row(state),
+            )
+            .into_element()
+        }))
         .child(
             chrome::workbench()
                 .child(input_pane(state, editor.clone()))
-                .child(result_pane(state, copied, editor, panes_shortcut)),
+                .child(result_pane(
+                    state,
+                    copied,
+                    editor,
+                    output_editor,
+                    tree_list,
+                    panes_shortcut,
+                )),
         )
+}
+
+fn install_search(
+    state: JsonState,
+    input: ElementRef,
+    output: ElementRef,
+    tree_list: ElementRef,
+    query_ref: ElementRef,
+) {
+    search_ui::watch_focus(state.search, query_ref);
+    let input_step = input.clone();
+    let output_step = output.clone();
+    effect(move || {
+        let revision = state.search.revision.get();
+        untracked(|| {
+            if revision == 0 || !state.search.open.get() {
+                return;
+            }
+            refresh_tree(state);
+            reveal(state, input.clone(), output.clone());
+        });
+    });
+    effect(move || {
+        let _ = state.search.index.get();
+        untracked(|| {
+            if !state.search.open.get() || state.find_target.get() == FindTarget::Tree {
+                return;
+            }
+            reveal(state, input_step.clone(), output_step.clone());
+        });
+    });
+    effect(move || {
+        let cursor = state.tree_cursor.get();
+        untracked(|| {
+            if !state.search.open.get() || state.find_target.get() != FindTarget::Tree {
+                return;
+            }
+            let tree_list = tree_list.clone();
+            spawn(async move {
+                next_frame().await;
+                tree_list.scroll_to_index(cursor as u32, 0.25, 0.0, false);
+            });
+        });
+    });
+}
+
+fn step_json(state: JsonState, delta: isize) {
+    if state.find_target.get() == FindTarget::Tree {
+        state.step_tree(delta);
+    } else {
+        state.search.step(delta);
+    }
+}
+
+fn find_target_row(state: JsonState) -> impl IntoElement {
+    let target = state.find_target;
+    chrome::segment_row()
+        .child(chrome::segment("Input", target, FindTarget::Input, move |value| {
+            state.find_target.set(value);
+            state.schedule_search();
+        }))
+        .child(chrome::segment("Result", target, FindTarget::Result, move |value| {
+            state.find_target.set(value);
+            state.schedule_search();
+        }))
+        .child(chrome::segment("Tree", target, FindTarget::Tree, move |value| {
+            state.find_target.set(value);
+            state.schedule_search();
+        }))
+}
+
+fn refresh_tree(state: JsonState) {
+    if state.search.query.with(String::is_empty) {
+        state.filtered_tree.set(None);
+        state.publish_find_label();
+        return;
+    }
+    let pattern = state.search.query.get();
+    let case_sensitive = state.search.case_sensitive.get();
+    let regex_mode = state.search.regex.get();
+    let Ok(needle) = find::Needle::compile(&pattern, case_sensitive, regex_mode) else {
+        state.filtered_tree.set(None);
+        state.publish_find_label();
+        return;
+    };
+    let Some(rows) = state.result.with(|result| {
+        let value = result.as_ref().and_then(|result| result.value.as_ref())?;
+        Some(filtered_tree_rows(value, |text| needle.matches(text)))
+    }) else {
+        state.filtered_tree.set(None);
+        state.publish_find_label();
+        return;
+    };
+    let cursor = rows.iter().position(|row| row.matched).unwrap_or(0);
+    state.tree_cursor.set(cursor);
+    state.filtered_tree.set(Some(rows));
+    state.publish_find_label();
+}
+
+fn reveal(state: JsonState, input: ElementRef, output: ElementRef) {
+    if state.find_target.get() == FindTarget::Tree {
+        state.restore_input();
+        state.restore_output();
+        return;
+    }
+    let Some(hit) = state.search.current() else {
+        match state.find_target.get() {
+            FindTarget::Result => state.restore_output(),
+            FindTarget::Input | FindTarget::Tree => state.restore_input(),
+        }
+        return;
+    };
+    let target = state.find_target.get();
+    let full = match target {
+        FindTarget::Result => state.formatted.get(),
+        FindTarget::Input | FindTarget::Tree => state.source.get(),
+    };
+    let revealed = reveal_match(&full, hit.start, hit.end);
+    if target == FindTarget::Result {
+        state.output_origin.set(revealed.preview.byte_start);
+        state.output_line.set(revealed.line);
+        state.output_capped.set(revealed.preview.capped);
+        state.output_field.set(revealed.preview.text);
+        search_ui::select_later(output, revealed.utf16_start, revealed.utf16_end);
+    } else {
+        state.field_origin.set(revealed.preview.byte_start);
+        state.field_line.set(revealed.line);
+        state.field_capped.set(revealed.preview.capped);
+        state.field.set(revealed.preview.text);
+        search_ui::select_later(input, revealed.utf16_start, revealed.utf16_end);
+    }
 }
 
 fn page_header(state: JsonState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
@@ -274,7 +576,13 @@ enum Badge {
 fn input_pane(state: JsonState, editor: ElementRef) -> impl IntoElement {
     column_pane()
         .child(input_header(state))
-        .child(cap_note(state.field_capped, state.source, state.field))
+        .child(cap_note(
+            state.field_capped,
+            state.source,
+            state.field,
+            state.field_origin,
+            state.field_line,
+        ))
         .child(
             chrome::mono_field(
                 state.field,
@@ -309,8 +617,19 @@ fn cap_note(
     show: Signal<bool>,
     full: Signal<String>,
     preview: Signal<String>,
+    origin: Signal<usize>,
+    line: Signal<u32>,
 ) -> impl IntoElement {
     dynamic(move || {
+        let origin = origin.get();
+        if origin > 0 {
+            let message = full.with(|full| window_message(full.len(), line.get()));
+            return view().child(
+                text(message)
+                    .text_xs()
+                    .text_color(move || theme().warning),
+            );
+        }
         if !show.get() {
             return view();
         }
@@ -327,6 +646,8 @@ fn result_pane(
     state: JsonState,
     copied: Signal<Option<String>>,
     editor: ElementRef,
+    output_editor: ElementRef,
+    tree_list: ElementRef,
     shortcut: String,
 ) -> impl IntoElement {
     column_pane()
@@ -340,8 +661,8 @@ fn result_pane(
                         .w_full()
                         .gap(px(8.0))
                         .pb(px(8.0))
-                        .child(banner_and_output(state, editor, shortcut))
-                        .child(tree_section(state, copied))
+                        .child(banner_and_output(state, editor, output_editor, shortcut))
+                        .child(tree_section(state, copied, tree_list))
                         .child(steps_section(state)),
                 ),
         )
@@ -373,6 +694,7 @@ fn result_header(state: JsonState) -> impl IntoElement {
 fn banner_and_output(
     state: JsonState,
     editor: ElementRef,
+    output_editor: ElementRef,
     shortcut: String,
 ) -> impl IntoElement {
     dynamic(move || {
@@ -384,10 +706,10 @@ fn banner_and_output(
         };
         let mut column = view().w_full().gap(px(12.0));
         if !diagnostics.is_empty() {
-            column = column.child(notes(diagnostics, editor.clone()));
+            column = column.child(notes(state, diagnostics, editor.clone()));
         }
         if state.has_output.get() {
-            column = column.child(output_block(state));
+            column = column.child(output_block(state, output_editor.clone()));
         }
         column
     })
@@ -416,11 +738,11 @@ fn empty_result(state: JsonState, shortcut: String) -> View {
     }
 }
 
-fn notes(diagnostics: Vec<Diagnostic>, editor: ElementRef) -> impl IntoElement {
+fn notes(state: JsonState, diagnostics: Vec<Diagnostic>, editor: ElementRef) -> impl IntoElement {
     let mut card = chrome::card().child(chrome::section("Notes"));
     for diagnostic in diagnostics {
         let tint = tint_for(&diagnostic);
-        card = card.child(diagnostic_row(diagnostic, tint, editor.clone()));
+        card = card.child(diagnostic_row(state, diagnostic, tint, editor.clone()));
     }
     card
 }
@@ -433,7 +755,12 @@ fn tint_for(diagnostic: &Diagnostic) -> AdaptiveColor {
     }
 }
 
-fn diagnostic_row(diagnostic: Diagnostic, tint: AdaptiveColor, editor: ElementRef) -> impl IntoElement {
+fn diagnostic_row(
+    state: JsonState,
+    diagnostic: Diagnostic,
+    tint: AdaptiveColor,
+    editor: ElementRef,
+) -> impl IntoElement {
     let line = format!(
         "{} · {} · line {}, column {}",
         severity_name(diagnostic.severity),
@@ -444,7 +771,7 @@ fn diagnostic_row(diagnostic: Diagnostic, tint: AdaptiveColor, editor: ElementRe
     let range = diagnostic.range;
     view()
         .role(AccessibilityRole::Button)
-        .on_press(move |_: &()| select_range(&editor, range))
+        .on_press(move |_: &()| select_range(state, &editor, range))
         .child(
             text(line)
                 .text_xs()
@@ -452,17 +779,27 @@ fn diagnostic_row(diagnostic: Diagnostic, tint: AdaptiveColor, editor: ElementRe
         )
 }
 
-fn select_range(editor: &ElementRef, range: Option<SourceRange>) {
+fn select_range(state: JsonState, editor: &ElementRef, range: Option<SourceRange>) {
     let Some(range) = range else {
         return;
     };
-    let start = u32::try_from(range.utf16_start).unwrap_or(u32::MAX);
-    let end = u32::try_from(range.utf16_end).unwrap_or(u32::MAX);
-    editor.set_selection(start, end);
-    editor.focus();
+    let full = state.source.get();
+    let start = find::byte_at_utf16(&full, range.utf16_start);
+    let end = find::byte_at_utf16(&full, range.utf16_end);
+    let revealed = reveal_match(&full, start, end);
+    state.field_origin.set(revealed.preview.byte_start);
+    state.field_line.set(revealed.line);
+    state.field_capped.set(revealed.preview.capped);
+    state.field.set(revealed.preview.text);
+    search_ui::select_later(editor.clone(), revealed.utf16_start, revealed.utf16_end);
+    let editor = editor.clone();
+    spawn(async move {
+        next_frame().await;
+        editor.focus();
+    });
 }
 
-fn output_block(state: JsonState) -> impl IntoElement {
+fn output_block(state: JsonState, output_editor: ElementRef) -> impl IntoElement {
     view()
         .w_full()
         .gap(px(6.0))
@@ -470,29 +807,45 @@ fn output_block(state: JsonState) -> impl IntoElement {
             state.output_capped,
             state.formatted,
             state.output_field,
+            state.output_origin,
+            state.output_line,
         ))
-        .child(output_field(state.output_field))
+        .child(output_field(state.output_field, output_editor))
 }
 
-fn output_field(value: Signal<String>) -> impl IntoElement {
+fn output_field(value: Signal<String>, output_editor: ElementRef) -> impl IntoElement {
     chrome::mono_field(value, "", true, false, |_| {})
+        .element_ref(&output_editor)
         .test_id("json-output")
         .h(px(220.0))
         .w_full()
 }
 
-fn tree_section(state: JsonState, copied: Signal<Option<String>>) -> impl IntoElement {
+fn tree_section(
+    state: JsonState,
+    copied: Signal<Option<String>>,
+    tree_list: ElementRef,
+) -> impl IntoElement {
     dynamic(move || {
         let open = state.tree_open.get();
-        let rows = state.result.with(|result| {
-            result.as_ref().and_then(|result| result.value.as_ref()).map(|value| {
-                if open {
-                    tree_rows(value, &state.expanded.get())
-                } else {
-                    Vec::new()
-                }
+        let filtering = state.filtered_tree.with(|rows| rows.is_some());
+        let rows = if let Some(filtered) = state.filtered_tree.get() {
+            if open {
+                Some(filtered)
+            } else {
+                Some(Vec::new())
+            }
+        } else {
+            state.result.with(|result| {
+                result.as_ref().and_then(|result| result.value.as_ref()).map(|value| {
+                    if open {
+                        tree_rows(value, &state.expanded.get())
+                    } else {
+                        Vec::new()
+                    }
+                })
             })
-        });
+        };
         let Some(rows) = rows else {
             return view();
         };
@@ -508,14 +861,26 @@ fn tree_section(state: JsonState, copied: Signal<Option<String>>) -> impl IntoEl
                         .text_color(move || theme().foreground),
                 ),
         );
-        if open {
+        if open && filtering && rows.is_empty() {
+            block = block.child(chrome::hint("No matching nodes"));
+        } else if open {
             let rows = Rc::new(rows);
             let keys = Rc::clone(&rows);
             block = block.child(
                 virtual_list(rows.len(), {
                     let rows = Rc::clone(&rows);
-                    move |at| tree_row(Rc::clone(&rows), at, state.expanded, copied)
+                    move |at| {
+                        tree_row(
+                            Rc::clone(&rows),
+                            at,
+                            state.expanded,
+                            copied,
+                            state.tree_cursor,
+                            filtering,
+                        )
+                    }
                 })
+                .element_ref(&tree_list)
                 .keys(move || keys.iter().map(|row| row.id.clone()).collect::<Vec<_>>())
                 .estimated_item_size(28.0)
                 .h(px(280.0))
@@ -548,6 +913,8 @@ fn tree_row(
     at: Position,
     expanded: Signal<Vec<String>>,
     copied: Signal<Option<String>>,
+    cursor: Signal<usize>,
+    filtering: bool,
 ) -> impl IntoElement {
     let depth_rows = Rc::clone(&rows);
     let mark_rows = Rc::clone(&rows);
@@ -556,6 +923,7 @@ fn tree_row(
     let copied_rows = Rc::clone(&rows);
     let disclosure_rows = Rc::clone(&rows);
     let label_press_rows = Rc::clone(&rows);
+    let tint_rows = Rc::clone(&rows);
     view()
         .flex_row()
         .items_center()
@@ -565,6 +933,16 @@ fn tree_row(
         .px(px(4.0))
         .gap(px(4.0))
         .rounded(px(6.0))
+        .bg(move || {
+            let matched = tint_rows.get(at.index()).is_some_and(|row| row.matched);
+            if matched && cursor.get() == at.index() {
+                theme().list_active
+            } else if matched {
+                theme().selection
+            } else {
+                AdaptiveColor::TRANSPARENT
+            }
+        })
         .hover(|style| style.bg(move || theme().list_head))
         .child(
             text(move || {
@@ -588,9 +966,13 @@ fn tree_row(
             .w(px(14.0))
             .text_xs()
             .text_color(move || theme().muted_foreground)
-            .on_press(move |_: &()| toggle_row(&disclosure_rows, at.index(), expanded)),
+            .on_press(move |_: &()| {
+                if !filtering {
+                    toggle_row(&disclosure_rows, at.index(), expanded);
+                }
+            }),
         )
-        .child(tree_label(label_rows, at, expanded, label_press_rows))
+        .child(tree_label(label_rows, at, expanded, label_press_rows, filtering))
         .child(tree_copy(copy_rows, copied_rows, at, copied))
 }
 
@@ -639,6 +1021,7 @@ fn tree_label(
     at: Position,
     expanded: Signal<Vec<String>>,
     press_rows: Rc<Vec<TreeRow>>,
+    filtering: bool,
 ) -> impl IntoElement {
     let key_rows = Rc::clone(&rows);
     let value_rows = Rc::clone(&rows);
@@ -649,7 +1032,11 @@ fn tree_label(
         .flex_row()
         .items_center()
         .gap(px(6.0))
-        .on_press(move |_: &()| toggle_row(&press_rows, at.index(), expanded))
+        .on_press(move |_: &()| {
+            if !filtering {
+                toggle_row(&press_rows, at.index(), expanded);
+            }
+        })
         .child(
             text(move || {
                 key_rows

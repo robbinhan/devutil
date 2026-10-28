@@ -5,10 +5,12 @@
 //! hosts the TSX entry.
 
 mod chrome;
+mod find;
 mod hash_model;
 mod hash_tool;
 mod json_model;
 mod json_tool;
+mod search_ui;
 mod timestamp_model;
 mod timestamp_tool;
 mod url_model;
@@ -64,6 +66,7 @@ pub fn App() -> impl IntoElement {
     // be overwritten by whichever page registered last.
     bind_convert("mod+enter", tool, json, timestamp, url, hash);
     bind_convert("ctrl+enter", tool, json, timestamp, url, hash);
+    bind_find(tool, json, timestamp, url, hash);
 
     // `flex_1` is what makes this host fill the window. A percentage height
     // does not: the root's child otherwise stays as tall as its content.
@@ -81,6 +84,7 @@ pub fn App() -> impl IntoElement {
                 .flex_col()
                 .child(pages(tool, json, timestamp, url, hash, copied, shortcut)),
         )
+        .child(find_keys(tool, json, timestamp, url, hash))
 }
 
 /// `DEVUTIL_HASH_FILE=/path` hashes that file on startup, in the file mode.
@@ -132,6 +136,151 @@ fn bind_convert(
             Tool::Hash => hash.run(),
         },
     );
+}
+
+fn bind_find(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+) {
+    let always = KeyOptions {
+        when: When::Always,
+        repeat: false,
+    };
+    let repeat = KeyOptions {
+        when: When::Always,
+        repeat: true,
+    };
+    on_key_with("mod+f", always, move |_| toggle_find(tool, json, timestamp, url, hash));
+    on_key_with("mod+g", repeat, move |_| {
+        open_find(tool, json, timestamp, url, hash);
+        step_find(tool, json, timestamp, url, hash, 1);
+    });
+    on_key_with("shift+mod+g", repeat, move |_| {
+        open_find(tool, json, timestamp, url, hash);
+        step_find(tool, json, timestamp, url, hash, -1);
+    });
+}
+
+fn find_keys(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+) -> impl IntoElement {
+    let open = computed(move || match tool.get() {
+        Tool::Json => json.search.open.get(),
+        Tool::Timestamp => timestamp.search.open.get(),
+        Tool::Url => url.search.open.get(),
+        Tool::Hash => hash.search.open.get(),
+    });
+    If::new(open, move || {
+        let always = KeyOptions {
+            when: When::Always,
+            repeat: true,
+        };
+        on_key_with("escape", KeyOptions { repeat: false, ..always }, move |_| {
+            close_find(tool, json, timestamp, url, hash);
+        });
+        on_key_with("enter", always, move |_| {
+            step_find(tool, json, timestamp, url, hash, 1);
+        });
+        on_key_with("shift+enter", always, move |_| {
+            step_find(tool, json, timestamp, url, hash, -1);
+        });
+        view()
+    })
+}
+
+fn toggle_find(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+) {
+    let open = match tool.get() {
+        Tool::Json => json.search.open.get(),
+        Tool::Timestamp => timestamp.search.open.get(),
+        Tool::Url => url.search.open.get(),
+        Tool::Hash => hash.search.open.get(),
+    };
+    if open {
+        close_find(tool, json, timestamp, url, hash);
+    } else {
+        open_find(tool, json, timestamp, url, hash);
+    }
+}
+
+fn open_find(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+) {
+    match tool.get() {
+        Tool::Json => {
+            json.search.open.set(true);
+            json.search.request_focus();
+            json.schedule_search();
+        }
+        Tool::Timestamp => {
+            timestamp.search.open.set(true);
+            timestamp.search.request_focus();
+            timestamp.schedule_search();
+        }
+        Tool::Url => {
+            url.search.open.set(true);
+            url.search.request_focus();
+            url.schedule_search();
+        }
+        Tool::Hash => {
+            hash.search.open.set(true);
+            hash.search.request_focus();
+            hash.schedule_search();
+        }
+    }
+}
+
+fn close_find(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+) {
+    match tool.get() {
+        Tool::Json => json.close_search(),
+        Tool::Timestamp => timestamp.search.open.set(false),
+        Tool::Url => url.search.open.set(false),
+        Tool::Hash => hash.close_search(),
+    }
+}
+
+fn step_find(
+    tool: Signal<Tool>,
+    json: JsonState,
+    timestamp: TimestampState,
+    url: UrlState,
+    hash: HashState,
+    delta: isize,
+) {
+    match tool.get() {
+        Tool::Json => {
+            if json.find_target.get() == json_tool::FindTarget::Tree {
+                json.step_tree(delta);
+            } else {
+                json.search.step(delta);
+            }
+        }
+        Tool::Timestamp => timestamp.search.step(delta),
+        Tool::Url => url.search.step(delta),
+        Tool::Hash => hash.search.step(delta),
+    }
 }
 
 fn select_tool(tool: Signal<Tool>, copied: Signal<Option<String>>, next: Tool) {
