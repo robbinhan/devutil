@@ -1,0 +1,10 @@
+[package]
+name = "markdown_core"
+version = "0.1.0"
+edition = "2021"
+description = "Markdown block model and HTML export (GitHub-flavored, via pulldown-cmark)"
+license = "MIT"
+publish = false
+
+[dependencies]
+pulldown-cmark = "0.13"

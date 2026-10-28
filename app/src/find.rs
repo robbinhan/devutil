@@ -1,10 +1,11 @@
 //! Full-text search for the workbench.
 //!
-//! The text view only holds a short prefix. Matches are found in the whole
-//! string, off the engine thread when that string is large. A hit outside
-//! the prefix is shown by replacing the prefix with a window around the hit;
-//! NSH can then select that range. It cannot scroll a selection into view,
-//! so the window starts a couple of lines above the hit.
+//! Matches are found in the whole string, off the engine thread when that
+//! string is large. NSH 0.1.1 can select a UTF-16 range, but on macOS that
+//! selection is invisible while the find field is focused, and
+//! `set_selection` never scrolls. The field text therefore always starts at
+//! the current match's line, and [`snippets`] draws every hit on the nearby
+//! lines (the current one stronger) under the find bar.
 
 use std::time::Duration;
 
@@ -244,6 +245,196 @@ fn contains_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieceKind {
+    Plain,
+    /// Another hit on the same line.
+    Hit,
+    /// The hit the count is pointing at.
+    Current,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnippetPiece {
+    pub text: String,
+    pub kind: PieceKind,
+}
+
+/// One hit's line, with every hit on that line marked. Long lines keep a
+/// window around the current (or first) hit so the preview stays small.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snippet {
+    pub hit_index: usize,
+    pub line: u32,
+    pub pieces: Vec<SnippetPiece>,
+}
+
+/// Hits shown on either side of the current one.
+pub const SNIPPET_RADIUS: usize = 4;
+
+/// Up to `radius` hits on either side of `current`, one row per hit.
+pub fn snippets(text: &str, hits: &[TextHit], current: usize, radius: usize) -> Vec<Snippet> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let current = current.min(hits.len() - 1);
+    let from = current.saturating_sub(radius);
+    let to = (current + radius + 1).min(hits.len());
+    hits[from..to]
+        .iter()
+        .enumerate()
+        .map(|(offset, hit)| {
+            let index = from + offset;
+            snippet_for(text, hits, index, hit)
+        })
+        .collect()
+}
+
+fn snippet_for(text: &str, hits: &[TextHit], index: usize, hit: &TextHit) -> Snippet {
+    let start = hit.start.min(text.len());
+    let line_at = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = text[start..]
+        .find('\n')
+        .map(|i| start + i)
+        .unwrap_or(text.len());
+    let line_no = (text[..start].bytes().filter(|b| *b == b'\n').count() + 1) as u32;
+    let on_line: Vec<&TextHit> = hits
+        .iter()
+        .filter(|hit| hit.start >= line_at && hit.start < line_end && hit.end > hit.start)
+        .collect();
+    let line = &text[line_at..line_end];
+    let focus = hit.start.saturating_sub(line_at).min(line.len());
+    let focus_end = hit.end.saturating_sub(line_at).clamp(focus, line.len());
+    let (slice_start, slice_end) = line_window(line, focus, focus_end);
+    let base = line_at + slice_start;
+    let end = line_at + slice_end;
+    let mut pieces = Vec::new();
+    if slice_start > 0 {
+        pieces.push(SnippetPiece {
+            text: "…".to_string(),
+            kind: PieceKind::Plain,
+        });
+    }
+    let mut cursor = base;
+    for hit in on_line {
+        let hit_start = hit.start.clamp(base, end);
+        let hit_end = hit.end.clamp(base, end);
+        if hit_end <= hit_start {
+            continue;
+        }
+        if hit_start > cursor {
+            pieces.push(SnippetPiece {
+                text: slice_text(text, cursor, hit_start),
+                kind: PieceKind::Plain,
+            });
+        }
+        let kind = if hit.start == hits[index].start && hit.end == hits[index].end {
+            PieceKind::Current
+        } else {
+            PieceKind::Hit
+        };
+        pieces.push(SnippetPiece {
+            text: slice_text(text, hit_start, hit_end),
+            kind,
+        });
+        cursor = hit_end;
+    }
+    if cursor < end {
+        pieces.push(SnippetPiece {
+            text: slice_text(text, cursor, end),
+            kind: PieceKind::Plain,
+        });
+    }
+    if slice_end < line_end - line_at {
+        pieces.push(SnippetPiece {
+            text: "…".to_string(),
+            kind: PieceKind::Plain,
+        });
+    }
+    Snippet {
+        hit_index: index,
+        line: line_no,
+        pieces,
+    }
+}
+
+fn line_window(line: &str, focus: usize, focus_end: usize) -> (usize, usize) {
+    const LIMIT: usize = 160;
+    let len = line.len();
+    if len <= LIMIT {
+        return (0, len);
+    }
+    let focus = floor_char(line, focus.min(len));
+    let focus_end = ceil_char(line, focus_end.clamp(focus, len));
+    let mut start = floor_char(line, focus.saturating_sub(40));
+    let mut end = ceil_char(line, (start + LIMIT).min(len));
+    if end < focus_end {
+        end = focus_end.min(len);
+        start = floor_char(line, end.saturating_sub(LIMIT));
+    }
+    if end > len {
+        end = len;
+    }
+    (start, end.max(start))
+}
+
+fn slice_text(text: &str, start: usize, end: usize) -> String {
+    let start = floor_char(text, start.min(text.len()));
+    let end = ceil_char(text, end.clamp(start, text.len()));
+    text[start..end].to_string()
+}
+
+fn ceil_char(text: &str, mut index: usize) -> usize {
+    if index > text.len() {
+        return text.len();
+    }
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Split `label` into plain and matching pieces for a tree row.
+pub fn pieces(label: &str, pattern: &str, case_sensitive: bool, regex_mode: bool) -> Vec<SnippetPiece> {
+    if pattern.is_empty() {
+        return vec![SnippetPiece {
+            text: label.to_string(),
+            kind: PieceKind::Plain,
+        }];
+    }
+    let outcome = search(label, pattern, case_sensitive, regex_mode);
+    if outcome.hits.is_empty() {
+        return vec![SnippetPiece {
+            text: label.to_string(),
+            kind: PieceKind::Plain,
+        }];
+    }
+    let mut pieces = Vec::new();
+    let mut cursor = 0;
+    for hit in outcome.hits {
+        if hit.start > cursor && hit.start <= label.len() {
+            pieces.push(SnippetPiece {
+                text: label[cursor..hit.start].to_string(),
+                kind: PieceKind::Plain,
+            });
+        }
+        if hit.end > hit.start && hit.end <= label.len() {
+            pieces.push(SnippetPiece {
+                text: label[hit.start..hit.end].to_string(),
+                kind: PieceKind::Current,
+            });
+            cursor = hit.end;
+        }
+    }
+    if cursor < label.len() {
+        pieces.push(SnippetPiece {
+            text: label[cursor..].to_string(),
+            kind: PieceKind::Plain,
+        });
+    }
+    pieces
+}
+
 pub fn status_label(
     query_empty: bool,
     busy: bool,
@@ -338,6 +529,9 @@ pub struct TextSearch {
     pub revision: Signal<u64>,
     pub focus: Signal<u64>,
     pub label: Signal<String>,
+    /// Nearby lines, with every hit marked. Empty when find is closed or
+    /// the tree is the thing being stepped through.
+    pub snippets: Signal<Vec<Snippet>>,
 }
 
 impl TextSearch {
@@ -356,7 +550,16 @@ impl TextSearch {
             revision: signal(0),
             focus: signal(0),
             label: signal(String::new()),
+            snippets: signal(Vec::new()),
         }
+    }
+
+    /// Rebuild the rows under the find bar from the full document.
+    pub fn publish_snippets(self, text: &str) {
+        let built = self
+            .hits
+            .with(|hits| snippets(text, hits, self.index.get(), SNIPPET_RADIUS));
+        self.snippets.set(built);
     }
 
     pub fn request_focus(self) {
@@ -433,6 +636,7 @@ impl TextSearch {
 
     pub fn clear_hits(self) {
         self.hits.set(Vec::new());
+        self.snippets.set(Vec::new());
         self.truncated.set(false);
         self.error.set(String::new());
         self.index.set(0);
@@ -532,5 +736,41 @@ mod tests {
         assert_eq!(status_label(false, false, "", 2, 17, false), "3 / 17");
         assert_eq!(status_label(false, false, "", 0, 50_000, true), "1 / 50000+");
         assert_eq!(status_label(false, false, "bad", 0, 0, false), "bad");
+    }
+
+    #[test]
+    fn snippets_mark_the_current_hit_and_keep_character_boundaries() {
+        let text = "red blue red\ngreen red";
+        let hits = search(text, "red", true, false).hits;
+        assert_eq!(hits.len(), 3);
+        let rows = snippets(text, &hits, 1, 2);
+        assert!(rows.len() >= 2);
+        let current = rows.iter().find(|row| row.hit_index == 1).expect("current");
+        assert_eq!(current.line, 1);
+        assert!(current.pieces.iter().any(|piece| {
+            piece.kind == PieceKind::Current && piece.text == "red"
+        }));
+        assert!(current.pieces.iter().any(|piece| piece.kind == PieceKind::Hit));
+
+        let line = format!("{}NEEDLE{}", "你".repeat(80), "你".repeat(80));
+        let text = format!("head\n{line}\ntail");
+        let outcome = search(&text, "NEEDLE", true, false);
+        let rows = snippets(&text, &outcome.hits, 0, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].line, 2);
+        let joined: String = rows[0].pieces.iter().map(|piece| piece.text.as_str()).collect();
+        assert!(joined.contains("NEEDLE"));
+        assert!(rows[0].pieces.iter().any(|piece| {
+            piece.kind == PieceKind::Current && piece.text == "NEEDLE"
+        }));
+    }
+
+    #[test]
+    fn pieces_split_a_label_around_the_match() {
+        let parts = pieces("city: Shanghai", "Shang", true, false);
+        assert!(parts.iter().any(|piece| {
+            piece.kind == PieceKind::Current && piece.text == "Shang"
+        }));
+        assert!(parts.iter().any(|piece| piece.kind == PieceKind::Plain && piece.text.contains("city")));
     }
 }

@@ -4,6 +4,7 @@ use timestamp_core::{TimestampEngine, TimestampUnit};
 
 use crate::chrome::{self, column_pane};
 use crate::find::TextSearch;
+use crate::json_model::{self, field_text, window_message, FieldWrite};
 use crate::search_ui;
 use crate::timestamp_model::{self, DisplayZone, Tone};
 use nsh_core::ui::prelude::*;
@@ -17,6 +18,12 @@ pub const SAMPLE: &str = "\
 #[derive(Clone, Copy)]
 pub struct TimestampState {
     pub source: Signal<String>,
+    /// What the text view shows. Find replaces this with a window that
+    /// starts on the match line. `source` stays the whole document.
+    pub field: Signal<String>,
+    pub field_origin: Signal<usize>,
+    pub field_line: Signal<u32>,
+    pub field_capped: Signal<bool>,
     pub unit: Signal<TimestampUnit>,
     pub zone: Signal<DisplayZone>,
     pub analysis: Signal<Option<timestamp_core::TimestampAnalysis>>,
@@ -26,14 +33,63 @@ pub struct TimestampState {
 
 impl TimestampState {
     pub fn new() -> Self {
+        let sample = SAMPLE.to_string();
         Self {
-            source: signal(SAMPLE.to_string()),
+            source: signal(sample.clone()),
+            field: signal(sample),
+            field_origin: signal(0),
+            field_line: signal(0),
+            field_capped: signal(false),
             unit: signal(TimestampUnit::Automatic),
             zone: signal(DisplayZone::Local),
             analysis: signal(None),
             analysis_zone: signal(None),
             search: TextSearch::new(),
         }
+    }
+
+    pub fn publish_source(self, text: String) {
+        let shown = field_text(&text);
+        self.field_origin.set(0);
+        self.field_line.set(0);
+        self.field_capped.set(shown.capped);
+        self.field.set(shown.text);
+        self.source.set(text);
+        if self.search.open.get() {
+            self.schedule_search();
+        }
+    }
+
+    pub fn on_field(self, text: String) {
+        let preview = self.field.get();
+        let origin = self.field_origin.get();
+        let write = self
+            .source
+            .with(|source| json_model::field_write(source, &preview, origin, &text));
+        match write {
+            FieldWrite::Echo => {}
+            FieldWrite::KeepPreview => {
+                self.field.update(|_| {});
+            }
+            FieldWrite::Replace(next) => self.publish_source(next),
+            FieldWrite::Splice(next) => {
+                self.field.set(text);
+                self.source.set(next);
+                if self.search.open.get() {
+                    self.schedule_search();
+                }
+            }
+        }
+    }
+
+    pub fn close_search(self) {
+        self.search.open.set(false);
+        self.search.snippets.set(Vec::new());
+        let shown = self.source.with(|text| field_text(text));
+        self.field_origin.set(0);
+        self.field_line.set(0);
+        self.field_capped.set(shown.capped);
+        self.field.set(shown.text);
     }
 
     pub fn schedule_search(self) {
@@ -63,7 +119,7 @@ impl TimestampState {
     }
 
     pub fn clear(self) {
-        self.source.set(String::new());
+        self.publish_source(String::new());
         self.analysis.set(None);
         self.analysis_zone.set(None);
     }
@@ -78,7 +134,15 @@ pub fn body(
     let editor = element_ref();
     let query_ref = element_ref();
     search_ui::watch_focus(state.search, query_ref.clone());
-    search_ui::watch_plain_field(state.search, state.source, editor.clone());
+    search_ui::watch_windowed_field(
+        state.search,
+        state.source,
+        state.field,
+        state.field_origin,
+        state.field_line,
+        state.field_capped,
+        editor.clone(),
+    );
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -146,18 +210,35 @@ fn input_pane(state: TimestampState, _shortcut: String, editor: ElementRef) -> i
         .child(unit_row(state))
         .child(zone_row(state))
         .child(status_line(state))
+        .child(field_note(state))
         .child(
-            chrome::mono_field(source, "1700000000", true, true, move |text| {
-                source.set(text);
-                if state.search.open.get() {
-                    state.schedule_search();
-                }
+            chrome::mono_field(state.field, "1700000000", true, true, move |text| {
+                state.on_field(text);
             })
             .element_ref(&editor)
             .test_id("timestamp-input")
                 .flex_1()
                 .min_h(px(120.0)),
         )
+}
+
+fn field_note(state: TimestampState) -> impl IntoElement {
+    dynamic(move || {
+        let origin = state.field_origin.get();
+        if origin == 0 {
+            return view().into_element();
+        }
+        let message = state
+            .source
+            .with(|full| window_message(full.len(), state.field_line.get()));
+        view()
+            .child(
+                text(message)
+                    .text_xs()
+                    .text_color(move || theme().warning),
+            )
+            .into_element()
+    })
 }
 
 fn header(source: Signal<String>) -> impl IntoElement {
@@ -286,7 +367,7 @@ fn results(state: TimestampState, copied: Signal<Option<String>>) -> impl IntoEl
             "Load sample",
             "ts-sample",
             move || {
-                state.source.set(SAMPLE.to_string());
+                state.publish_source(SAMPLE.to_string());
                 state.convert();
             },
         )

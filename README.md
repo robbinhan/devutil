@@ -1,8 +1,8 @@
 # DevUtil
 
-A local developer workbench: JSON, timestamps, URL percent-encoding, and hashes in one native window. JSON, timestamps, and URLs call the original Rust cores unchanged. Hashes live in `hash_core`. The window is an [NSH](https://nsh.dev) 0.1.1 Rust app. On macOS it renders with AppKit.
+A local developer workbench: JSON, timestamps, URL percent-encoding, hashes, and a Markdown preview in one native window. JSON, timestamps, and URLs call the original Rust cores unchanged. Hashes live in `hash_core`. Markdown lives in `markdown_core`. The window is an [NSH](https://nsh.dev) 0.1.1 Rust app. On macOS it renders with AppKit.
 
-Everything stays on the machine. There is no network.
+Documents stay on the machine. There is no account and no upload. Markdown can open an `http` or `https` link in the system browser and show an image from a URL.
 
 ## Features
 
@@ -10,6 +10,7 @@ Everything stays on the machine. There is no network.
 - **Timestamp** — convert Unix seconds, Unix milliseconds, ISO 8601, and `yyyy-MM-dd HH:mm:ss`, shown as local time, UTC, seconds, and milliseconds.
 - **URL** — percent-decode and encode `application/x-www-form-urlencoded` text, and split a URL into scheme, host, path, and query parameters.
 - **Hash** — MD5, SHA-1, SHA-2, SHA3-256, BLAKE3, and CRC32 for text or a file, plus HMAC, hex or Base64, and a compare field.
+- **Markdown** — split editor and preview. GitHub-flavored headings, lists, task lists, tables, quotes, code, and footnotes. Copy HTML, open a `.md` file, and search the editor with ⌘F.
 
 ## Layout
 
@@ -19,12 +20,13 @@ Everything stays on the machine. There is no network.
 | `crates/timestamp_core` | Unix seconds/milliseconds, ISO 8601, and `yyyy-MM-dd HH:mm:ss`. Unchanged. |
 | `crates/url_codec_core` | `application/x-www-form-urlencoded` decode and encode. Unchanged. |
 | `crates/hash_core` | MD5, SHA-1, SHA-2, SHA3-256, BLAKE3, CRC32, and HMAC. Streaming file hashes. |
+| `crates/markdown_core` | GitHub-flavored Markdown as a block model, plus HTML export. |
 | `app` | The NSH workbench (`devutil` library and binary). |
 | `App.tsx` | Mounts the Rust `App` so `nsh run` and `nsh package` can host it. |
 | `nsh.json` | App name `DevUtil`, id `app.devutil.nsh`, icon. Appearance follows the system. |
 | `assets/icon.png` | 1024×1024 icon taken from the previous app icon set. |
 
-The window opens on JSON. A sidebar switches among JSON, Timestamp, URL, and Hash. ⌘↩ (and Ctrl+Enter) runs the action for the visible tool: Analyze, Convert, Decode/Encode, or Hash. ⌘F opens find in the visible tool. Enter and ⌘G go to the next match, Shift+Enter and Shift+⌘G go to the previous one, and Esc closes the bar. Aa is case sensitive. `.*` is a regular expression. The count reads `3 / 17`.
+The window opens on JSON. A sidebar switches among JSON, Timestamp, URL, Hash, and Markdown. ⌘↩ (and Ctrl+Enter) runs the action for the visible tool: Analyze, Convert, Decode/Encode, or Hash. Markdown has no run action; the preview updates as you type. ⌘F opens find in the visible tool. Enter and ⌘G go to the next match, Shift+Enter and Shift+⌘G go to the previous one, and Esc closes the bar. Aa is case sensitive. `.*` is a regular expression. The count reads `3 / 17`. The current match is the first line of the field, and the rows under the find bar color every hit on those lines.
 
 ## Requirements
 
@@ -71,8 +73,7 @@ nsh package --target macos
 Tests, from the repo root:
 
 ```sh
-cargo test -p json_core -p timestamp_core -p url_codec_core -p hash_core
-cargo test -p devutil --lib
+cargo test --workspace
 ```
 
 ## What the window does
@@ -101,6 +102,8 @@ File mode opens a native file panel, then hashes the file in 1 MB chunks on a ba
 DEVUTIL_TOOL=hash DEVUTIL_HASH_FILE=some.bin cargo run -p devutil
 ```
 
+**Markdown.** The sidebar glyph is `M↓`. The left pane is the editor. The right pane is the rendered note: headings, paragraphs, bold, italic, strikethrough, inline code, links, quotes, lists (including nested lists and task checkboxes), fenced code with a language label and a Copy button, tables, rules, images, and footnotes. Paste, Copy HTML, Open, and Clear sit in the header, with a word and character count on the preview. An empty note offers a sample. ⌘F searches the editor. A large note is parsed off the UI thread. The preview keeps at most 2,000 blocks and 256 KB of text; Copy HTML still uses the whole note. `DEVUTIL_TOOL=markdown` opens this tool.
+
 ## Migration report
 
 Ported from the GPUI workbench (`gpui-kit` 0.6.6) onto NSH 0.1.1 Rust. The cores were copied as-is. The legacy Swift package was left behind.
@@ -118,13 +121,14 @@ The GTK 4 backend of the same binary was exercised on Linux (1100×720 window): 
 
 ### What is missing or degraded, and why
 
-- **No syntax highlighting, line numbers, gutter, or rope.** Find is in the workbench, not in the system find bar: NSH 0.1.1 multiline input is a plain `NSTextView` inside an `NSScrollView` with `setRichText(false)`, and it has no find bar. Single-line input is an `NSTextField`. The text container tracks the view width (`setHorizontallyResizable(false)`), so lines wrap and there is no horizontal scroller and no wrap toggle. A rope editor would be a custom native view. `set_selection` highlights a match in UTF-16 units of the text the view currently holds, and it does not scroll that selection into view, so a hit outside the 32 KB / 200-line window replaces the window with a slice that starts a couple of lines above the hit.
+- **No syntax highlighting, line numbers, gutter, or rope.** Find is in the workbench, not in the system find bar: NSH 0.1.1 multiline input is a plain `NSTextView` inside an `NSScrollView` with `setRichText(false)`, and it has no find bar, no `scrollRangeToVisible`, and no find indicator. Single-line input is an `NSTextField`. The text container tracks the view width (`setHorizontallyResizable(false)`), so lines wrap and there is no horizontal scroller and no wrap toggle. A rope editor would be a custom native view. `set_selection` sets a UTF-16 range and does not scroll. On macOS an unfocused `NSTextView` with `drawsBackground` false draws no selection, and focus stays in the find field so the query keeps the caret. The field text is therefore replaced so the current match's line is the first line, including small documents and the URL, Timestamp, Hash, and Markdown editors. Earlier text stays hidden until Find closes. Under the bar, nearby lines show every hit in the info color and the current hit in the primary color, semibold, on a tinted row. Click a row to jump. Tree rows color the matched substring the same way. NSH text runs have a foreground color and a weight, not a background, so the tint is the row behind the line. A custom `NSTextView` would need `AppView::register_component`, and `run_app` does not hand the app that view, so this build does not fork NSH.
 - **The text view cannot hold a multi-megabyte document.** Two NSH 0.1.1 mechanisms typeset the entire `input` value. The core's `measure_input` builds an attributed string with `max_lines: 0` and asks the platform text engine (CoreText on macOS, Pango on Linux) for the height of every line, even when the view's height is already set. The macOS view is an `NSTextView` with `setVerticallyResizable(true)` and a container height of `CGFloat::MAX`, so it lays out every line to size itself. One 3.8 MB line, then the pretty-printed copy of it, climbed past 6 GB here and did not settle. The fields therefore show a capped preview. Copy and Analyze read the full strings, which never go back into the text view.
 - **Object source ranges used to copy the whole prefix.** `StrictJSONParser::make_range` allocated `characters[..index]` into a `String` three times per object member, so a large array was quadratic. Ranges are now a UTF-16 offset table built once. The reported offsets are unchanged.
 - **The whole string is still the value of a small field.** `.value` is controlled text. Each keystroke delivers the full string through `on_change_text`. There is no rope. Above the preview limit the view is not given that string.
 - **Selection is per field.** 0.1.1 has no `SelectionArea`. Each result is its own text view, so a selection cannot cross cards. Readonly output uses `editable(false)` and stays selectable, so selecting and copying inside one field works. Binding `.selection` reapplies whenever the bound value changes and resets the caret, so the diagnostic jump uses `element_ref().set_selection` (UTF-16, the same units as `json_core::SourceRange`) and then focuses the editor.
 - **Return inserts a newline.** Multiline fields use submit behavior Newline. ⌘↩ is bound with `on_key_with(..., When::Always)` on the window so it runs before the field sees the key. Ctrl+Enter is bound the same way. ⌘Q, ⌘H, ⌥⌘H, ⌘M, and ⌃⌘F are reserved by the host. Quit stays on the application menu.
-- **The tree is a virtual list, not a tree widget.** 0.1.1 has no tree view and no tooltip (`nsh-ui-mobile` has lists and text fields, not those). Rows are one line and ellipsize. A Copy control on the row copies the full label. `virtual_list` recycles cells, so the row index is read inside the binding, not captured when the cell is built. Child ids are `{parent}/{index}`. The GPUI tree used `{id}/{key}`, which collides when one object has two fields with the same key. Index ids avoid that. A string of JSON gets a nested node id `{id}/nested` that starts collapsed. An expanded collection lists the first 1,000 children; GPUI built a node for every value up front. Find filters that list to matching keys and values, expands their ancestors, and still stops at 1,000 matching children per collection.
+- **The tree is a virtual list, not a tree widget.** 0.1.1 has no tree view and no tooltip (`nsh-ui-mobile` has lists and text fields, not those). Rows are one line and ellipsize. A Copy control on the row copies the full label. `virtual_list` recycles cells, so the row index is read inside the binding, not captured when the cell is built. Child ids are `{parent}/{index}`. The GPUI tree used `{id}/{key}`, which collides when one object has two fields with the same key. Index ids avoid that. A string of JSON gets a nested node id `{id}/nested` that starts collapsed. An expanded collection lists the first 1,000 children; GPUI built a node for every value up front. Find filters that list to matching keys and values, expands their ancestors, and still stops at 1,000 matching children per collection. The matched substring is primary and semibold. The current row uses the active list color; other matching rows use the selection color.
+- **Markdown has no in-app browser.** A link with an `http` or `https` URL is opened with `open` (macOS), `xdg-open` (Linux), or `start` (Windows). Other URLs stay as text. An image is an NSH `image` when the URL is `http(s)`, a `data:image` URL, or a file that exists next to an opened note (or an absolute path). Anything else is the alt text. Task checkboxes are drawn, not toggled in the source. The preview is native views in the app theme, so it follows light and dark mode. It is not a web view.
 - **Narrow windows squish the two columns.** Panes use `min_w(0)` and `h_full` so they fill the 1100×720 window. They do not stack. `flex_wrap` is set, but a full-height pane does not drop onto a second row.
 - **No minimum window size and no dock icon on `AppOptions`.** The macOS options in 0.1.1 have a title, a size, and an appearance. `cargo run -p devutil` uses the process icon. The 1024 PNG is applied by `nsh package` from `nsh.json`.
 - **`nsh-ui-mobile` is the wrong chrome.** Those controls are sized for touch. The toolbar, segments, and buttons are small desktop views in `app`.

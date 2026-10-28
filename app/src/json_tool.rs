@@ -100,6 +100,7 @@ impl JsonState {
 
     pub fn close_search(self) {
         self.search.open.set(false);
+        self.search.snippets.set(Vec::new());
         self.restore_input();
         self.restore_output();
         self.filtered_tree.set(None);
@@ -489,9 +490,11 @@ fn reveal(state: JsonState, input: ElementRef, output: ElementRef) {
     if state.find_target.get() == FindTarget::Tree {
         state.restore_input();
         state.restore_output();
+        state.search.snippets.set(Vec::new());
         return;
     }
     let Some(hit) = state.search.current() else {
+        state.search.snippets.set(Vec::new());
         match state.find_target.get() {
             FindTarget::Result => state.restore_output(),
             FindTarget::Input | FindTarget::Tree => state.restore_input(),
@@ -517,6 +520,7 @@ fn reveal(state: JsonState, input: ElementRef, output: ElementRef) {
         state.field.set(revealed.preview.text);
         search_ui::select_later(input, revealed.utf16_start, revealed.utf16_end);
     }
+    state.search.publish_snippets(&full);
 }
 
 fn page_header(state: JsonState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
@@ -877,6 +881,7 @@ fn tree_section(
                             copied,
                             state.tree_cursor,
                             filtering,
+                            state.search,
                         )
                     }
                 })
@@ -915,6 +920,7 @@ fn tree_row(
     copied: Signal<Option<String>>,
     cursor: Signal<usize>,
     filtering: bool,
+    search: TextSearch,
 ) -> impl IntoElement {
     let depth_rows = Rc::clone(&rows);
     let mark_rows = Rc::clone(&rows);
@@ -972,7 +978,14 @@ fn tree_row(
                 }
             }),
         )
-        .child(tree_label(label_rows, at, expanded, label_press_rows, filtering))
+        .child(tree_label(
+            label_rows,
+            at,
+            expanded,
+            label_press_rows,
+            filtering,
+            search,
+        ))
         .child(tree_copy(copy_rows, copied_rows, at, copied))
 }
 
@@ -1022,10 +1035,10 @@ fn tree_label(
     expanded: Signal<Vec<String>>,
     press_rows: Rc<Vec<TreeRow>>,
     filtering: bool,
+    search: TextSearch,
 ) -> impl IntoElement {
     let key_rows = Rc::clone(&rows);
-    let value_rows = Rc::clone(&rows);
-    let color_rows = rows;
+    let value_rows = rows;
     view()
         .flex_1()
         .min_w(px(0.0))
@@ -1037,41 +1050,85 @@ fn tree_label(
                 toggle_row(&press_rows, at.index(), expanded);
             }
         })
-        .child(
-            text(move || {
-                key_rows
-                    .get(at.index())
-                    .map(|row| label_key(&row.label))
-                    .unwrap_or_default()
-            })
-            .flex_none()
-            .number_of_lines(1)
-            .ellipsize_mode(EllipsizeMode::Tail)
-            .font_family(chrome::MONO)
-            .text_size(px(12.5))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(move || theme().foreground),
+        .child(dynamic(move || {
+            let label = key_rows
+                .get(at.index())
+                .map(|row| label_key(&row.label))
+                .unwrap_or_default();
+            if !filtering {
+                return text(label)
+                    .flex_none()
+                    .number_of_lines(1)
+                    .ellipsize_mode(EllipsizeMode::Tail)
+                    .font_family(chrome::MONO)
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(move || theme().foreground)
+                    .into_element();
+            }
+            let parts = row_pieces(&label, search);
+            search_ui::piece_line(parts, search_ui::Ink::Foreground)
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .into_element()
+        }))
+        .child(dynamic(move || {
+            let label = value_rows
+                .get(at.index())
+                .map(|row| row.label.clone())
+                .unwrap_or_default();
+            let value = label_value(&label);
+            let ink = value_ink(&label);
+            if !filtering {
+                return text(value)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .number_of_lines(1)
+                    .ellipsize_mode(EllipsizeMode::Tail)
+                    .font_family(chrome::MONO)
+                    .text_size(px(12.5))
+                    .text_color(move || ink_color(ink))
+                    .into_element();
+            }
+            let parts = row_pieces(&value, search);
+            search_ui::piece_line(parts, ink)
+                .flex_1()
+                .min_w(px(0.0))
+                .into_element()
+        }))
+}
+
+fn row_pieces(label: &str, search: TextSearch) -> Vec<find::SnippetPiece> {
+    search.query.with(|query| {
+        find::pieces(
+            label,
+            query,
+            search.case_sensitive.get(),
+            search.regex.get(),
         )
-        .child(
-            text(move || {
-                value_rows
-                    .get(at.index())
-                    .map(|row| label_value(&row.label))
-                    .unwrap_or_default()
-            })
-            .flex_1()
-            .min_w(px(0.0))
-            .number_of_lines(1)
-            .ellipsize_mode(EllipsizeMode::Tail)
-            .font_family(chrome::MONO)
-            .text_size(px(12.5))
-            .text_color(move || {
-                color_rows
-                    .get(at.index())
-                    .map(|row| value_color(&row.label))
-                    .unwrap_or_else(|| theme().foreground)
-            }),
-        )
+    })
+}
+
+fn value_ink(label: &str) -> search_ui::Ink {
+    let Some((_, value)) = label.split_once(": ") else {
+        return search_ui::Ink::Muted;
+    };
+    let value = value.trim();
+    if value.starts_with('"') {
+        search_ui::Ink::Success
+    } else if value == "true" || value == "false" {
+        search_ui::Ink::Primary
+    } else if value == "null" {
+        search_ui::Ink::Muted
+    } else if value.starts_with(|ch: char| ch.is_ascii_digit() || ch == '-') {
+        search_ui::Ink::Info
+    } else {
+        search_ui::Ink::Foreground
+    }
+}
+
+fn ink_color(ink: search_ui::Ink) -> AdaptiveColor {
+    search_ui::ink_color(ink)
 }
 
 fn label_key(label: &str) -> String {
@@ -1080,24 +1137,6 @@ fn label_key(label: &str) -> String {
 
 fn label_value(label: &str) -> String {
     label.split_once(": ").map(|(_, value)| value.to_string()).unwrap_or_default()
-}
-
-fn value_color(label: &str) -> AdaptiveColor {
-    let Some((_, value)) = label.split_once(": ") else {
-        return theme().muted_foreground;
-    };
-    let value = value.trim();
-    if value.starts_with('"') {
-        theme().success
-    } else if value == "true" || value == "false" {
-        theme().primary
-    } else if value == "null" {
-        theme().muted_foreground
-    } else if value.starts_with(|ch: char| ch.is_ascii_digit() || ch == '-') {
-        theme().info
-    } else {
-        theme().foreground
-    }
 }
 
 fn steps_section(state: JsonState) -> impl IntoElement {

@@ -2,7 +2,8 @@
 //! workbench: group box, hairline border, 12 px corners.
 
 use crate::chrome;
-use crate::find::{self, TextSearch};
+use crate::find::{PieceKind, SnippetPiece, TextSearch};
+use crate::json_model::{self, reveal_match};
 use nsh_core::ui::prelude::*;
 
 pub fn bar(
@@ -16,37 +17,43 @@ pub fn bar(
 ) -> impl IntoElement {
     view()
         .flex_none()
-        .flex_row()
-        .flex_wrap()
-        .items_center()
-        .gap(px(6.0))
+        .flex_col()
         .mx(px(20.0))
         .mb(px(8.0))
         .px(px(8.0))
         .py(px(6.0))
+        .gap(px(6.0))
         .rounded(px(12.0))
         .bg(move || theme().group_box)
         .border_1()
         .border_color(move || theme().border)
-        .child(chrome::section("Find"))
-        .child(query_field(search, query_ref, on_edit))
-        .child(flag("Aa", search.case_sensitive, "find-case", on_options))
-        .child(flag(".*", search.regex, "find-regex", on_options))
-        .child(step_button("↑", "find-prev", on_prev))
-        .child(step_button("↓", "find-next", on_next))
         .child(
-            text(move || search.label.get())
-                .text_xs()
-                .text_color(move || {
-                    if search.error.with(|error| !error.is_empty()) {
-                        theme().danger
-                    } else {
-                        theme().muted_foreground
-                    }
-                }),
+            view()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .child(chrome::section("Find"))
+                .child(query_field(search, query_ref, on_edit))
+                .child(flag("Aa", search.case_sensitive, "find-case", on_options))
+                .child(flag(".*", search.regex, "find-regex", on_options))
+                .child(step_button("↑", "find-prev", on_prev))
+                .child(step_button("↓", "find-next", on_next))
+                .child(
+                    text(move || search.label.get())
+                        .text_xs()
+                        .text_color(move || {
+                            if search.error.with(|error| !error.is_empty()) {
+                                theme().danger
+                            } else {
+                                theme().muted_foreground
+                            }
+                        }),
+                )
+                .child(view().flex_1())
+                .child(trailing),
         )
-        .child(view().flex_1())
-        .child(trailing)
+        .child(snippet_list(search))
 }
 
 fn query_field(
@@ -165,8 +172,115 @@ pub fn select_later(editor: ElementRef, start: u32, end: u32) {
     });
 }
 
-/// Select `hit` in a field whose value is the whole `text`.
-pub fn watch_plain_field(search: TextSearch, text: Signal<String>, editor: ElementRef) {
+/// Plain ink for a run that is not the current match. Text runs cannot
+/// carry a background, so a hit is a foreground color and a weight.
+#[derive(Clone, Copy)]
+pub enum Ink {
+    Foreground,
+    Muted,
+    Success,
+    Primary,
+    Info,
+}
+
+pub fn ink_color(ink: Ink) -> AdaptiveColor {
+    match ink {
+        Ink::Foreground => theme().foreground,
+        Ink::Muted => theme().muted_foreground,
+        Ink::Success => theme().success,
+        Ink::Primary => theme().primary,
+        Ink::Info => theme().info,
+    }
+}
+
+/// One line of a match. The current hit is semibold in the primary color.
+/// Other hits on that line use the info color. NSH has no background on a
+/// text run, so the row behind the current line carries the tint.
+pub fn piece_line(pieces: Vec<SnippetPiece>, plain: Ink) -> Text {
+    let mut line = text("")
+        .font_family(chrome::MONO)
+        .text_size(px(12.5))
+        .number_of_lines(1);
+    for piece in pieces {
+        let kind = piece.kind;
+        let mut span = text(piece.text)
+            .font_family(chrome::MONO)
+            .text_size(px(12.5))
+            .text_color(move || match kind {
+                PieceKind::Current => theme().primary,
+                PieceKind::Hit => theme().info,
+                PieceKind::Plain => ink_color(plain),
+            });
+        if kind == PieceKind::Current {
+            span = span.font_weight(FontWeight::SEMIBOLD);
+        }
+        line = line.child(span);
+    }
+    line
+}
+
+fn snippet_list(search: TextSearch) -> impl IntoElement {
+    dynamic(move || {
+        let rows = search.snippets.get();
+        if rows.is_empty() {
+            return view().into_element();
+        }
+        let current = search.index.get();
+        let mut list = view().flex_col().gap(px(2.0)).test_id("find-snippets");
+        for snippet in rows {
+            let index = snippet.hit_index;
+            let active = index == current;
+            let line_no = snippet.line;
+            let pieces = snippet.pieces;
+            list = list.child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .rounded(px(8.0))
+                    .bg(move || {
+                        if active {
+                            theme().list_active
+                        } else {
+                            AdaptiveColor::TRANSPARENT
+                        }
+                    })
+                    .hover(|style| style.bg(move || theme().list_head))
+                    .role(AccessibilityRole::Button)
+                    .label(format!("Match on line {line_no}"))
+                    .on_press(move |_: &()| {
+                        search.index.set(index);
+                        search.publish_label();
+                    })
+                    .child(
+                        text(format!("{line_no}"))
+                            .flex_none()
+                            .w(px(40.0))
+                            .font_family(chrome::MONO)
+                            .text_xs()
+                            .text_color(move || theme().muted_foreground),
+                    )
+                    .child(piece_line(pieces, Ink::Foreground).flex_1().min_w(px(0.0))),
+            );
+        }
+        list.into_element()
+    })
+}
+
+/// Replace `field` so the current match is the first line, and publish the
+/// styled rows. Used for documents that are not already split into a preview
+/// by the JSON or Hash tools (URL, Timestamp, Markdown).
+pub fn watch_windowed_field(
+    search: TextSearch,
+    source: Signal<String>,
+    field: Signal<String>,
+    origin: Signal<usize>,
+    line: Signal<u32>,
+    capped: Signal<bool>,
+    editor: ElementRef,
+) {
     effect(move || {
         let _ = search.revision.get();
         let _ = search.index.get();
@@ -175,10 +289,23 @@ pub fn watch_plain_field(search: TextSearch, text: Signal<String>, editor: Eleme
                 return;
             }
             let Some(hit) = search.current() else {
+                search.snippets.set(Vec::new());
+                let shown = source.with(|text| json_model::field_text(text));
+                origin.set(0);
+                line.set(0);
+                capped.set(shown.capped);
+                field.set(shown.text);
                 return;
             };
-            let (start, end) = text.with(|text| find::utf16_span(text, hit.start, hit.end));
-            select_later(editor.clone(), start, end);
+            let full = source.get();
+            let revealed = reveal_match(&full, hit.start, hit.end);
+            origin.set(revealed.preview.byte_start);
+            line.set(revealed.line);
+            capped.set(revealed.preview.capped);
+            field.set(revealed.preview.text);
+            search.publish_snippets(&full);
+            select_later(editor.clone(), revealed.utf16_start, revealed.utf16_end);
         });
     });
 }
+

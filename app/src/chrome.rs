@@ -361,7 +361,7 @@ where
         .on_press(move |_: &()| on_pick(value))
         .child(
             view()
-                .w(px(22.0))
+                .w(px(32.0))
                 .items_center()
                 .child(
                     text(glyph)

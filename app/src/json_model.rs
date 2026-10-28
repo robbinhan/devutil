@@ -70,16 +70,10 @@ pub fn reveal_match(full: &str, start: usize, end: usize) -> Reveal {
     let start = floor_char(full, start.min(full.len()));
     let end = floor_char(full, end.clamp(start, full.len()));
     let line = line_number(full, start);
-    let whole = field_text(full);
-    if !whole.capped {
-        let (utf16_start, utf16_end) = crate::find::utf16_span(full, start, end);
-        return Reveal {
-            preview: whole,
-            utf16_start,
-            utf16_end,
-            line,
-        };
-    }
+    // Always start at the match line, even when the whole document would
+    // fit. AppKit does not scroll a selection into view, and an unfocused
+    // NSTextView draws no selection (`drawsBackground` is false), so the
+    // only way to put the hit on screen is to make it the first line.
     let origin = window_origin(full, start, end);
     let window_end = take_window(full, origin);
     let shown_end = window_end.max(origin);
@@ -116,33 +110,61 @@ pub fn splice_window(full: &str, origin: usize, old_len: usize, edited: &str) ->
     Some(out)
 }
 
+/// What a keystroke in a windowed field should do to the full document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldWrite {
+    /// The platform echoed the text the field already shows.
+    Echo,
+    /// A small change inside a window. Put the preview back.
+    KeepPreview,
+    /// `origin` is 0, so this replaces the document.
+    Replace(String),
+    /// Splice the edited window back into the document.
+    Splice(String),
+}
+
+pub fn is_preview_edit(preview: &str, incoming: &str) -> bool {
+    if incoming.is_empty() || preview.is_empty() {
+        return false;
+    }
+    let shared = preview
+        .bytes()
+        .zip(incoming.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    shared > preview.len() / 2
+}
+
+pub fn field_write(source: &str, preview: &str, origin: usize, incoming: &str) -> FieldWrite {
+    if incoming == preview {
+        return FieldWrite::Echo;
+    }
+    if origin > 0 && is_preview_edit(preview, incoming) {
+        return FieldWrite::KeepPreview;
+    }
+    if origin == 0 {
+        return FieldWrite::Replace(incoming.to_string());
+    }
+    match splice_window(source, origin, preview.len(), incoming) {
+        Some(next) => FieldWrite::Splice(next),
+        None => FieldWrite::KeepPreview,
+    }
+}
+
 pub fn window_message(full_bytes: usize, line: u32) -> String {
     format!(
-        "Showing a window around the match on line {line}. The text view cannot hold the whole document ({}). Search uses the full text.",
+        "Match on line {line}, at the top of this field. Earlier text stays hidden until Find closes. Search uses the full {}.",
         format_bytes(full_bytes)
     )
 }
 
 fn window_origin(full: &str, start: usize, end: usize) -> usize {
     let line = line_start(full, start);
-    let with_context = retreat_lines(full, line, 2);
-    if take_window(full, with_context) >= end {
-        return with_context;
-    }
     if take_window(full, line) >= end {
         return line;
     }
+    // A single line longer than the field: start at the hit itself.
     start
-}
-
-fn retreat_lines(full: &str, mut at: usize, lines: usize) -> usize {
-    for _ in 0..lines {
-        if at == 0 {
-            break;
-        }
-        at = line_start(full, at - 1);
-    }
-    at
 }
 
 fn line_start(full: &str, at: usize) -> usize {
@@ -799,6 +821,7 @@ mod tests {
         let start = text.find(marker).unwrap();
         let revealed = reveal_match(&text, start, start + marker.len());
         assert!(revealed.preview.byte_start > 0);
+        assert!(revealed.preview.text.starts_with(marker));
         assert!(revealed.preview.text.contains(marker));
         assert!(revealed.preview.text.len() <= FIELD_LIMIT);
         assert!(revealed.preview.text.matches('\n').count() < FIELD_LINE_LIMIT);
@@ -825,6 +848,39 @@ mod tests {
         assert!(rows.iter().any(|row| row.matched && row.label.contains(&needle)));
         assert!(rows.len() < 20, "only the matching branch should be listed");
         assert!(!rows.iter().any(|row| row.label.contains("more")));
+    }
+
+    #[test]
+    fn a_short_document_opens_on_the_match_line() {
+        let text = "alpha\nbeta TARGET\ngamma\n";
+        let start = text.find("TARGET").unwrap();
+        let revealed = reveal_match(text, start, start + "TARGET".len());
+        assert!(revealed.preview.text.starts_with("beta TARGET"));
+        assert_eq!(revealed.preview.byte_start, text.find('\n').unwrap() + 1);
+        assert_eq!(
+            crate::find::slice_utf16(&revealed.preview.text, revealed.utf16_start, revealed.utf16_end),
+            "TARGET"
+        );
+
+        let first = reveal_match("TARGET\nsecond\n", 0, "TARGET".len());
+        assert_eq!(first.preview.byte_start, 0);
+        assert!(first.preview.text.starts_with("TARGET"));
+    }
+
+    #[test]
+    fn field_write_keeps_the_document_outside_the_window() {
+        assert_eq!(
+            field_write("abcdef", "cd", 2, "cd"),
+            FieldWrite::Echo
+        );
+        assert_eq!(
+            field_write("abcdef", "cd", 2, "XY"),
+            FieldWrite::Splice("abXYef".to_string())
+        );
+        assert_eq!(
+            field_write("abcdef", "ab", 0, "zz"),
+            FieldWrite::Replace("zz".to_string())
+        );
     }
 
     #[test]

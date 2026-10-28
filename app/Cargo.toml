@@ -20,6 +20,7 @@ json_core = { path = "../crates/json_core" }
 timestamp_core = { path = "../crates/timestamp_core" }
 url_codec_core = { path = "../crates/url_codec_core" }
 hash_core = { path = "../crates/hash_core" }
+markdown_core = { path = "../crates/markdown_core" }
 rfd = "0.15"
 env_logger = "0.11"
 regex = "1"

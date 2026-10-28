@@ -108,6 +108,7 @@ impl HashState {
 
     pub fn close_search(self) {
         self.search.open.set(false);
+        self.search.snippets.set(Vec::new());
         let shown = self.source.with(|text| field_text(text));
         self.field_origin.set(0);
         self.field_line.set(0);
@@ -430,6 +431,7 @@ pub fn body(state: HashState, copied: Signal<Option<String>>, shortcut: String) 
                 return;
             }
             let Some(hit) = state.search.current() else {
+                state.search.snippets.set(Vec::new());
                 return;
             };
             let full = state.source.get();
@@ -438,6 +440,7 @@ pub fn body(state: HashState, copied: Signal<Option<String>>, shortcut: String) 
             state.field_line.set(revealed.line);
             state.field_capped.set(revealed.preview.capped);
             state.field.set(revealed.preview.text);
+            state.search.publish_snippets(&full);
             search_ui::select_later(field_editor.clone(), revealed.utf16_start, revealed.utf16_end);
         });
     });

@@ -10,6 +10,7 @@ mod hash_model;
 mod hash_tool;
 mod json_model;
 mod json_tool;
+mod markdown_tool;
 mod search_ui;
 mod timestamp_model;
 mod timestamp_tool;
@@ -18,6 +19,7 @@ mod url_tool;
 
 use hash_tool::HashState;
 use json_tool::JsonState;
+use markdown_tool::MarkdownState;
 use nsh_core::keymap::When;
 use nsh_core::ui::prelude::*;
 use timestamp_tool::TimestampState;
@@ -34,6 +36,7 @@ enum Tool {
     Timestamp,
     Url,
     Hash,
+    Markdown,
 }
 
 /// The components the TSX entry imports from `app/native`.
@@ -42,7 +45,8 @@ fn native(registry: &mut Registry) {
     registry.register::<App>();
 }
 
-/// One window, four local tools. ⌘↩ (and Ctrl+Enter) runs the visible tool.
+/// One window, five local tools. ⌘↩ (and Ctrl+Enter) runs the visible tool.
+/// Markdown has no run action; its preview updates as you type.
 /// Appearance follows the system; `theme.json` has a light and a dark palette.
 #[component]
 pub fn App() -> impl IntoElement {
@@ -54,19 +58,21 @@ pub fn App() -> impl IntoElement {
     let url = UrlState::new();
     let hash = HashState::new();
     load_dev_hash(hash);
+    let markdown = MarkdownState::new();
     match std::env::var("DEVUTIL_TOOL").ok().as_deref() {
         Some("timestamp") => tool.set(Tool::Timestamp),
         Some("url") => tool.set(Tool::Url),
         Some("hash") => tool.set(Tool::Hash),
+        Some("markdown") => tool.set(Tool::Markdown),
         _ => {}
     }
     let shortcut = key_label("mod+enter");
 
     // Bound once. Each page stays mounted, so a binding inside a page would
     // be overwritten by whichever page registered last.
-    bind_convert("mod+enter", tool, json, timestamp, url, hash);
-    bind_convert("ctrl+enter", tool, json, timestamp, url, hash);
-    bind_find(tool, json, timestamp, url, hash);
+    bind_convert("mod+enter", tool, json, timestamp, url, hash, markdown);
+    bind_convert("ctrl+enter", tool, json, timestamp, url, hash, markdown);
+    bind_find(tool, json, timestamp, url, hash, markdown);
 
     // `flex_1` is what makes this host fill the window. A percentage height
     // does not: the root's child otherwise stays as tall as its content.
@@ -75,16 +81,18 @@ pub fn App() -> impl IntoElement {
         .flex_row()
         .bg(move || theme().background)
         .text_color(move || theme().foreground)
-        .child(sidebar(tool, copied, shortcut.clone()))
-        .child(
-            view()
-                .flex_1()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .flex_col()
-                .child(pages(tool, json, timestamp, url, hash, copied, shortcut)),
-        )
-        .child(find_keys(tool, json, timestamp, url, hash))
+                .child(sidebar(tool, copied, shortcut.clone()))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .flex_col()
+                        .child(pages(
+                            tool, json, timestamp, url, hash, markdown, copied, shortcut,
+                        )),
+                )
+                .child(find_keys(tool, json, timestamp, url, hash, markdown))
 }
 
 /// `DEVUTIL_HASH_FILE=/path` hashes that file on startup, in the file mode.
@@ -122,6 +130,7 @@ fn bind_convert(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    _markdown: MarkdownState,
 ) {
     on_key_with(
         keystroke,
@@ -134,6 +143,7 @@ fn bind_convert(
             Tool::Timestamp => timestamp.convert(),
             Tool::Url => url.convert(),
             Tool::Hash => hash.run(),
+            Tool::Markdown => {}
         },
     );
 }
@@ -144,6 +154,7 @@ fn bind_find(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
 ) {
     let always = KeyOptions {
         when: When::Always,
@@ -153,14 +164,16 @@ fn bind_find(
         when: When::Always,
         repeat: true,
     };
-    on_key_with("mod+f", always, move |_| toggle_find(tool, json, timestamp, url, hash));
+    on_key_with("mod+f", always, move |_| {
+        toggle_find(tool, json, timestamp, url, hash, markdown)
+    });
     on_key_with("mod+g", repeat, move |_| {
-        open_find(tool, json, timestamp, url, hash);
-        step_find(tool, json, timestamp, url, hash, 1);
+        open_find(tool, json, timestamp, url, hash, markdown);
+        step_find(tool, json, timestamp, url, hash, markdown, 1);
     });
     on_key_with("shift+mod+g", repeat, move |_| {
-        open_find(tool, json, timestamp, url, hash);
-        step_find(tool, json, timestamp, url, hash, -1);
+        open_find(tool, json, timestamp, url, hash, markdown);
+        step_find(tool, json, timestamp, url, hash, markdown, -1);
     });
 }
 
@@ -170,12 +183,14 @@ fn find_keys(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
 ) -> impl IntoElement {
     let open = computed(move || match tool.get() {
         Tool::Json => json.search.open.get(),
         Tool::Timestamp => timestamp.search.open.get(),
         Tool::Url => url.search.open.get(),
         Tool::Hash => hash.search.open.get(),
+        Tool::Markdown => markdown.search.open.get(),
     });
     If::new(open, move || {
         let always = KeyOptions {
@@ -183,13 +198,13 @@ fn find_keys(
             repeat: true,
         };
         on_key_with("escape", KeyOptions { repeat: false, ..always }, move |_| {
-            close_find(tool, json, timestamp, url, hash);
+            close_find(tool, json, timestamp, url, hash, markdown);
         });
         on_key_with("enter", always, move |_| {
-            step_find(tool, json, timestamp, url, hash, 1);
+            step_find(tool, json, timestamp, url, hash, markdown, 1);
         });
         on_key_with("shift+enter", always, move |_| {
-            step_find(tool, json, timestamp, url, hash, -1);
+            step_find(tool, json, timestamp, url, hash, markdown, -1);
         });
         view()
     })
@@ -201,17 +216,19 @@ fn toggle_find(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
 ) {
     let open = match tool.get() {
         Tool::Json => json.search.open.get(),
         Tool::Timestamp => timestamp.search.open.get(),
         Tool::Url => url.search.open.get(),
         Tool::Hash => hash.search.open.get(),
+        Tool::Markdown => markdown.search.open.get(),
     };
     if open {
-        close_find(tool, json, timestamp, url, hash);
+        close_find(tool, json, timestamp, url, hash, markdown);
     } else {
-        open_find(tool, json, timestamp, url, hash);
+        open_find(tool, json, timestamp, url, hash, markdown);
     }
 }
 
@@ -221,6 +238,7 @@ fn open_find(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
 ) {
     match tool.get() {
         Tool::Json => {
@@ -243,6 +261,11 @@ fn open_find(
             hash.search.request_focus();
             hash.schedule_search();
         }
+        Tool::Markdown => {
+            markdown.search.open.set(true);
+            markdown.search.request_focus();
+            markdown.schedule_search();
+        }
     }
 }
 
@@ -252,12 +275,14 @@ fn close_find(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
 ) {
     match tool.get() {
         Tool::Json => json.close_search(),
-        Tool::Timestamp => timestamp.search.open.set(false),
-        Tool::Url => url.search.open.set(false),
+        Tool::Timestamp => timestamp.close_search(),
+        Tool::Url => url.close_search(),
         Tool::Hash => hash.close_search(),
+        Tool::Markdown => markdown.close_search(),
     }
 }
 
@@ -267,6 +292,7 @@ fn step_find(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
     delta: isize,
 ) {
     match tool.get() {
@@ -280,6 +306,7 @@ fn step_find(
         Tool::Timestamp => timestamp.search.step(delta),
         Tool::Url => url.search.step(delta),
         Tool::Hash => hash.search.step(delta),
+        Tool::Markdown => markdown.search.step(delta),
     }
 }
 
@@ -329,6 +356,9 @@ fn sidebar(tool: Signal<Tool>, copied: Signal<Option<String>>, shortcut: String)
         .child(chrome::nav_item("#", "Hash", tool, Tool::Hash, move |next| {
             select_tool(tool, copied, next)
         }))
+        .child(chrome::nav_item("M↓", "Markdown", tool, Tool::Markdown, move |next| {
+            select_tool(tool, copied, next)
+        }))
         .child(view().flex_1())
         .child(
             text(move || format!("{shortcut} runs this tool"))
@@ -345,12 +375,14 @@ fn pages(
     timestamp: TimestampState,
     url: UrlState,
     hash: HashState,
+    markdown: MarkdownState,
     copied: Signal<Option<String>>,
     shortcut: String,
 ) -> impl IntoElement {
     let timestamp_shortcut = shortcut.clone();
     let url_shortcut = shortcut.clone();
     let hash_shortcut = shortcut.clone();
+    let markdown_shortcut = shortcut.clone();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -369,6 +401,10 @@ fn pages(
         .child(page(
             move || tool.get() == Tool::Hash,
             hash_tool::body(hash, copied, hash_shortcut),
+        ))
+        .child(page(
+            move || tool.get() == Tool::Markdown,
+            markdown_tool::body(markdown, copied, markdown_shortcut),
         ))
 }
 
