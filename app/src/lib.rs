@@ -1,10 +1,12 @@
 //! DevUtil workbench on Native Shell 0.1.1.
 //!
-//! The tools call `json_core`, `timestamp_core`, `url_codec_core`, and
-//! `hash_core` directly. `App.tsx` mounts this same `App` when `nsh run`
-//! hosts the TSX entry.
+//! The tools call `json_core`, `timestamp_core`, `url_codec_core`,
+//! `hash_core`, `markdown_core`, and `diff_core` directly. `App.tsx` mounts
+//! this same `App` when `nsh run` hosts the TSX entry.
 
 mod chrome;
+mod diff_model;
+mod diff_tool;
 mod find;
 mod hash_model;
 mod hash_tool;
@@ -17,6 +19,7 @@ mod timestamp_tool;
 mod url_model;
 mod url_tool;
 
+use diff_tool::DiffState;
 use hash_tool::HashState;
 use json_tool::JsonState;
 use markdown_tool::MarkdownState;
@@ -37,6 +40,7 @@ enum Tool {
     Url,
     Hash,
     Markdown,
+    Diff,
 }
 
 /// The components the TSX entry imports from `app/native`.
@@ -45,8 +49,9 @@ fn native(registry: &mut Registry) {
     registry.register::<App>();
 }
 
-/// One window, five local tools. ⌘↩ (and Ctrl+Enter) runs the visible tool.
-/// Markdown has no run action; its preview updates as you type.
+/// One window, six local tools. ⌘↩ (and Ctrl+Enter) runs the visible tool.
+/// Markdown has no run action; its preview updates as you type. Diff
+/// compares as you type, and ⌘↩ compares at once. Diff has no find bar.
 /// Appearance follows the system; `theme.json` has a light and a dark palette.
 #[component]
 pub fn App() -> impl IntoElement {
@@ -59,19 +64,21 @@ pub fn App() -> impl IntoElement {
     let hash = HashState::new();
     load_dev_hash(hash);
     let markdown = MarkdownState::new();
+    let diff = DiffState::new();
     match std::env::var("DEVUTIL_TOOL").ok().as_deref() {
         Some("timestamp") => tool.set(Tool::Timestamp),
         Some("url") => tool.set(Tool::Url),
         Some("hash") => tool.set(Tool::Hash),
         Some("markdown") => tool.set(Tool::Markdown),
+        Some("diff") => tool.set(Tool::Diff),
         _ => {}
     }
     let shortcut = key_label("mod+enter");
 
     // Bound once. Each page stays mounted, so a binding inside a page would
     // be overwritten by whichever page registered last.
-    bind_convert("mod+enter", tool, json, timestamp, url, hash, markdown);
-    bind_convert("ctrl+enter", tool, json, timestamp, url, hash, markdown);
+    bind_convert("mod+enter", tool, json, timestamp, url, hash, markdown, diff);
+    bind_convert("ctrl+enter", tool, json, timestamp, url, hash, markdown, diff);
     bind_find(tool, json, timestamp, url, hash, markdown);
 
     // `flex_1` is what makes this host fill the window. A percentage height
@@ -89,7 +96,7 @@ pub fn App() -> impl IntoElement {
                         .min_h(px(0.0))
                         .flex_col()
                         .child(pages(
-                            tool, json, timestamp, url, hash, markdown, copied, shortcut,
+                            tool, json, timestamp, url, hash, markdown, diff, copied, shortcut,
                         )),
                 )
                 .child(find_keys(tool, json, timestamp, url, hash, markdown))
@@ -123,6 +130,7 @@ fn load_dev_json(json: JsonState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_convert(
     keystroke: &str,
     tool: Signal<Tool>,
@@ -131,6 +139,7 @@ fn bind_convert(
     url: UrlState,
     hash: HashState,
     _markdown: MarkdownState,
+    diff: DiffState,
 ) {
     on_key_with(
         keystroke,
@@ -144,6 +153,7 @@ fn bind_convert(
             Tool::Url => url.convert(),
             Tool::Hash => hash.run(),
             Tool::Markdown => {}
+            Tool::Diff => diff.compare_now(),
         },
     );
 }
@@ -191,6 +201,7 @@ fn find_keys(
         Tool::Url => url.search.open.get(),
         Tool::Hash => hash.search.open.get(),
         Tool::Markdown => markdown.search.open.get(),
+        Tool::Diff => false,
     });
     If::new(open, move || {
         let always = KeyOptions {
@@ -224,6 +235,7 @@ fn toggle_find(
         Tool::Url => url.search.open.get(),
         Tool::Hash => hash.search.open.get(),
         Tool::Markdown => markdown.search.open.get(),
+        Tool::Diff => false,
     };
     if open {
         close_find(tool, json, timestamp, url, hash, markdown);
@@ -266,6 +278,8 @@ fn open_find(
             markdown.search.request_focus();
             markdown.schedule_search();
         }
+        // Two editors and a row list: no single text to search.
+        Tool::Diff => {}
     }
 }
 
@@ -283,6 +297,7 @@ fn close_find(
         Tool::Url => url.close_search(),
         Tool::Hash => hash.close_search(),
         Tool::Markdown => markdown.close_search(),
+        Tool::Diff => {}
     }
 }
 
@@ -307,6 +322,7 @@ fn step_find(
         Tool::Url => url.search.step(delta),
         Tool::Hash => hash.search.step(delta),
         Tool::Markdown => markdown.search.step(delta),
+        Tool::Diff => {}
     }
 }
 
@@ -359,6 +375,9 @@ fn sidebar(tool: Signal<Tool>, copied: Signal<Option<String>>, shortcut: String)
         .child(chrome::nav_item("M↓", "Markdown", tool, Tool::Markdown, move |next| {
             select_tool(tool, copied, next)
         }))
+        .child(chrome::nav_item("±", "Diff", tool, Tool::Diff, move |next| {
+            select_tool(tool, copied, next)
+        }))
         .child(view().flex_1())
         .child(
             text(move || format!("{shortcut} runs this tool"))
@@ -376,6 +395,7 @@ fn pages(
     url: UrlState,
     hash: HashState,
     markdown: MarkdownState,
+    diff: DiffState,
     copied: Signal<Option<String>>,
     shortcut: String,
 ) -> impl IntoElement {
@@ -383,6 +403,7 @@ fn pages(
     let url_shortcut = shortcut.clone();
     let hash_shortcut = shortcut.clone();
     let markdown_shortcut = shortcut.clone();
+    let diff_shortcut = shortcut.clone();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -405,6 +426,10 @@ fn pages(
         .child(page(
             move || tool.get() == Tool::Markdown,
             markdown_tool::body(markdown, copied, markdown_shortcut),
+        ))
+        .child(page(
+            move || tool.get() == Tool::Diff,
+            diff_tool::body(diff, copied, diff_shortcut),
         ))
 }
 

@@ -1,6 +1,6 @@
 # DevUtil
 
-A local developer workbench: JSON, timestamps, URL percent-encoding, hashes, and a Markdown preview in one native window. JSON, timestamps, and URLs call the original Rust cores unchanged. Hashes live in `hash_core`. Markdown lives in `markdown_core`. The window is an [NSH](https://nsh.dev) 0.1.1 Rust app. On macOS it renders with AppKit.
+A local developer workbench: JSON, timestamps, URL percent-encoding, hashes, a Markdown preview, and a text diff in one native window. JSON, timestamps, and URLs call the original Rust cores unchanged. Hashes live in `hash_core`. Markdown lives in `markdown_core`. Diff lives in `diff_core`. The window is an [NSH](https://nsh.dev) 0.1.1 Rust app. On macOS it renders with AppKit.
 
 Documents stay on the machine. There is no account and no upload. Markdown can open an `http` or `https` link in the system browser and show an image from a URL.
 
@@ -11,6 +11,7 @@ Documents stay on the machine. There is no account and no upload. Markdown can o
 - **URL** — percent-decode and encode `application/x-www-form-urlencoded` text, and split a URL into scheme, host, path, and query parameters.
 - **Hash** — MD5, SHA-1, SHA-2, SHA3-256, BLAKE3, and CRC32 for text or a file, plus HMAC, hex or Base64, and a compare field.
 - **Markdown** — split editor and preview. GitHub-flavored headings, lists, task lists, tables, quotes, code, and footnotes. Copy HTML, open a `.md` file, and search the editor with ⌘F.
+- **Diff** — compare an original and a changed text side by side or as a unified view, with line numbers, `+`/`-` markers, and the changed words marked inside a line. Ignore whitespace, ignore case, or format both sides as JSON with sorted keys. Swap, Clear, Paste and Open for each side, and Copy diff as a unified patch.
 
 ## Layout
 
@@ -21,12 +22,13 @@ Documents stay on the machine. There is no account and no upload. Markdown can o
 | `crates/url_codec_core` | `application/x-www-form-urlencoded` decode and encode. Unchanged. |
 | `crates/hash_core` | MD5, SHA-1, SHA-2, SHA3-256, BLAKE3, CRC32, and HMAC. Streaming file hashes. |
 | `crates/markdown_core` | GitHub-flavored Markdown as a block model, plus HTML export. |
+| `crates/diff_core` | Line diff (via `similar`) with word spans inside changed lines, folded context, and unified patch output. |
 | `app` | The NSH workbench (`devutil` library and binary). |
 | `App.tsx` | Mounts the Rust `App` so `nsh run` and `nsh package` can host it. |
 | `nsh.json` | App name `DevUtil`, id `app.devutil.nsh`, icon. Appearance follows the system. |
 | `assets/icon.png` | 1024×1024 icon taken from the previous app icon set. |
 
-The window opens on JSON. A sidebar switches among JSON, Timestamp, URL, Hash, and Markdown. ⌘↩ (and Ctrl+Enter) runs the action for the visible tool: Analyze, Convert, Decode/Encode, or Hash. Markdown has no run action; the preview updates as you type. ⌘F opens find in the visible tool. Enter and ⌘G go to the next match, Shift+Enter and Shift+⌘G go to the previous one, and Esc closes the bar. Aa is case sensitive. `.*` is a regular expression. The count reads `3 / 17`. The current match is the first line of the field, and the rows under the find bar color every hit on those lines.
+The window opens on JSON. A sidebar switches among JSON, Timestamp, URL, Hash, Markdown, and Diff. ⌘↩ (and Ctrl+Enter) runs the action for the visible tool: Analyze, Convert, Decode/Encode, Hash, or Compare. Markdown has no run action; the preview updates as you type. ⌘F opens find in the visible tool. Enter and ⌘G go to the next match, Shift+Enter and Shift+⌘G go to the previous one, and Esc closes the bar. Aa is case sensitive. `.*` is a regular expression. The count reads `3 / 17`. The current match is the first line of the field, and the rows under the find bar color every hit on those lines.
 
 ## Requirements
 
@@ -104,6 +106,8 @@ DEVUTIL_TOOL=hash DEVUTIL_HASH_FILE=some.bin cargo run -p devutil
 
 **Markdown.** The sidebar glyph is `M↓`. The left pane is the editor. The right pane is the rendered note: headings, paragraphs, bold, italic, strikethrough, inline code, links, quotes, lists (including nested lists and task checkboxes), fenced code with a language label and a Copy button, tables, rules, images, and footnotes. Paste, Copy HTML, Open, and Clear sit in the header, with a word and character count on the preview. An empty note offers a sample. ⌘F searches the editor. A large note is parsed off the UI thread. The preview keeps at most 2,000 blocks and 256 KB of text; Copy HTML still uses the whole note. `DEVUTIL_TOOL=markdown` opens this tool.
 
+**Diff.** The sidebar glyph is `±`. Original and Changed are two editors side by side, each with Paste and Open. The header has Swap, Copy diff, Clear, and the primary Compare button. The result card shows `+added` and `−removed` line counts, the number of change blocks, and the line counts of both sides, or an Identical state. Side by side pairs a removed line with the added line that replaced it; Unified lists removed lines before added ones with both line numbers. Removed rows are red and added rows green, with a `-` or `+` marker and a tinted row behind the text; words that changed inside a paired line are semibold and underlined. Lines can be All or Changes (three lines of context, the rest folded into an `⋯ N unchanged lines` row). Ignore whitespace (compare with all whitespace removed) and Ignore case change how lines match, not the text shown. Format JSON parses both sides as strict JSON and compares them pretty-printed with sorted keys; when either side is not JSON, both are compared as text. Copy diff writes a `diff -u` style patch (`--- a/…`, `+++ b/…`, `@@` hunks, three lines of context) of the full texts, named after opened files. Edits wait 250 ms before comparing, inputs larger than 256 KB together are compared on a background thread, and each view builds at most 5,000 rows (the counts and the patch still cover everything). An empty Diff offers a synthetic sample. Diff has no find bar. `DEVUTIL_TOOL=diff` opens this tool.
+
 ## Migration report
 
 Ported from the GPUI workbench (`gpui-kit` 0.6.6) onto NSH 0.1.1 Rust. The cores were copied as-is. The legacy Swift package was left behind.
@@ -136,6 +140,7 @@ The GTK 4 backend of the same binary was exercised on Linux (1100×720 window): 
 - **Appearance follows the system.** `theme.json` defines a light palette and a dark palette. `nsh.json` does not force `"appearance": "light"`, and the window asks for `Appearance::System`. NSH 0.1.1 has no SF Symbols, so the sidebar marks are glyphs. A row cannot show its copy control only while the pointer is over it, so tree and digest rows keep a small muted copy mark. There is no syntax color for the editor itself; the tree tints keys, strings, numbers, and booleans from the label text.
 - **NSH 0.1.1 has no file panel.** There is no `NSOpenPanel` or GTK file chooser in the 0.1.1 API. Hash's Open button uses the `rfd` crate, which presents `NSOpenPanel` on macOS (hopping to the main thread) and an XDG desktop-portal dialog on Linux. The panel is not reachable from `NSH_SCRIPT`. `DEVUTIL_HASH_FILE` starts a file hash without it.
 - **Workers cannot write signals.** `spawn` runs on the engine thread. File and large-text hashes use `blocking` (`tokio::task::spawn_blocking`). Progress is an atomic counter the engine reads on a 100 ms timer.
+- **Diff rows are views, not a text view.** NSH 0.1.1 text runs take a color, a weight, and an underline, but no background, so a changed line is a tinted row behind the run and a changed word is semibold and underlined rather than highlighted. The rows are a `virtual_list`; long lines wrap. Selection works within one line, not across rows. The editors are the same capped text views as the other tools (32,768 UTF-16 units and 200 lines shown); the compare and Copy diff use the full text, and an edit in a capped view is spliced back into it. ⌘F does nothing on Diff: there are two editors and a row list, not one text.
 - **No tooltip.** A matching digest is a green border, a Match label, and the status line. BLAKE3's keyed mode is not HMAC, so HMAC mode does not invent a BLAKE3 or CRC32 result.
 
 ### Recommendations

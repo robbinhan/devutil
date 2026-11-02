@@ -1,0 +1,10 @@
+[package]
+name = "diff_core"
+version = "0.1.0"
+edition = "2021"
+description = "Line diff with word-level spans and unified patch output (via similar)"
+license = "MIT"
+publish = false
+
+[dependencies]
+similar = "2"
