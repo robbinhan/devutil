@@ -1,15 +1,12 @@
 //! Full-text search for the workbench.
 //!
 //! Matches are found in the whole string, off the engine thread when that
-//! string is large. NSH 0.1.1 can select a UTF-16 range, but on macOS that
-//! selection is invisible while the find field is focused, and
-//! `set_selection` never scrolls. The field text therefore always starts at
-//! the current match's line, and [`snippets`] draws every hit on the nearby
-//! lines (the current one stronger) under the find bar.
+//! string is large. The editor highlights them and scrolls the current one
+//! into view. [`snippets`] still draws the nearby hits under the find bar.
 
 use std::time::Duration;
 
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 /// Stored hits. A pattern that matches every byte of a multi-megabyte
 /// document is not kept in full.
@@ -463,7 +460,25 @@ pub fn status_label(
     }
 }
 
-/// UTF-16 offsets of `start..end` inside `text`, for [`ElementRef::set_selection`].
+/// A position in `text`: a 0-based line and a UTF-16 column on that line.
+/// The same units as NSH 0.3's `EditorPosition`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextPoint {
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Where byte `byte` sits. Offsets that fall inside a scalar move back to
+/// its start. Past the end is the end.
+pub fn point_at(text: &str, byte: usize) -> TextPoint {
+    let byte = floor_char(text, byte.min(text.len()));
+    let line = text[..byte].bytes().filter(|b| *b == b'\n').count() as u32;
+    let line_start = text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = text[line_start..byte].encode_utf16().count() as u32;
+    TextPoint { line, column }
+}
+
+/// UTF-16 offsets of `start..end` inside `text`.
 /// The text of a UTF-16 selection. Used to check that a reveal highlights the hit.
 #[cfg(test)]
 pub fn slice_utf16(text: &str, start: u32, end: u32) -> String {
@@ -493,6 +508,7 @@ pub fn byte_at_utf16(text: &str, units: usize) -> usize {
     text.len()
 }
 
+#[cfg(test)]
 pub fn utf16_span(text: &str, start: usize, end: usize) -> (u32, u32) {
     let start = floor_char(text, start.min(text.len()));
     let end = floor_char(text, end.clamp(start, text.len()));
@@ -772,5 +788,18 @@ mod tests {
             piece.kind == PieceKind::Current && piece.text == "Shang"
         }));
         assert!(parts.iter().any(|piece| piece.kind == PieceKind::Plain && piece.text.contains("city")));
+    }
+
+    #[test]
+    fn point_at_counts_lines_and_utf16_columns() {
+        let text = "ab\n你c";
+        assert_eq!(point_at(text, 0), TextPoint { line: 0, column: 0 });
+        assert_eq!(point_at(text, 3), TextPoint { line: 1, column: 0 });
+        let ni = text.find('你').unwrap();
+        assert_eq!(
+            point_at(text, ni + '你'.len_utf8()),
+            TextPoint { line: 1, column: 1 }
+        );
+        assert_eq!(point_at(text, text.len() + 4).line, 1);
     }
 }

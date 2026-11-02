@@ -39,6 +39,7 @@ pub const FIELD_LINE_LIMIT: usize = 200;
 pub const TREE_CHILD_LIMIT: usize = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct FieldPreview {
     pub text: String,
     /// Byte offset of `text` in the full document. The default view is the prefix.
@@ -47,6 +48,28 @@ pub struct FieldPreview {
 }
 
 /// The prefix a text view is allowed to show. Not capped when `full` fits.
+/// The editor stores LF line breaks. `\r\n` and a bare `\r` become `\n`
+/// so a find offset in the stored text is the same offset in the editor.
+pub fn normalize_newlines(text: String) -> String {
+    if !text.contains('\r') {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 pub fn field_text(full: &str) -> FieldPreview {
     let end = preview_end(full);
     FieldPreview {
@@ -59,6 +82,7 @@ pub fn field_text(full: &str) -> FieldPreview {
 /// Where a hit landed, and the slice the text view should show so the hit
 /// is near the top. NSH selects UTF-16 units of that slice; it does not
 /// scroll a selection into view, so the slice itself is the scroll.
+#[cfg(test)]
 pub struct Reveal {
     pub preview: FieldPreview,
     pub utf16_start: u32,
@@ -66,6 +90,7 @@ pub struct Reveal {
     pub line: u32,
 }
 
+#[cfg(test)]
 pub fn reveal_match(full: &str, start: usize, end: usize) -> Reveal {
     let start = floor_char(full, start.min(full.len()));
     let end = floor_char(full, end.clamp(start, full.len()));
@@ -95,6 +120,7 @@ pub fn reveal_match(full: &str, start: usize, end: usize) -> Reveal {
 
 /// Replace the slice a window was showing. `None` when the offsets are not
 /// on character boundaries, so a bad edit cannot tear the document.
+#[cfg(test)]
 pub fn splice_window(full: &str, origin: usize, old_len: usize, edited: &str) -> Option<String> {
     if !full.is_char_boundary(origin) {
         return None;
@@ -112,6 +138,7 @@ pub fn splice_window(full: &str, origin: usize, old_len: usize, edited: &str) ->
 
 /// What a keystroke in a windowed field should do to the full document.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum FieldWrite {
     /// The platform echoed the text the field already shows.
     Echo,
@@ -123,6 +150,7 @@ pub enum FieldWrite {
     Splice(String),
 }
 
+#[cfg(test)]
 pub fn is_preview_edit(preview: &str, incoming: &str) -> bool {
     if incoming.is_empty() || preview.is_empty() {
         return false;
@@ -135,6 +163,7 @@ pub fn is_preview_edit(preview: &str, incoming: &str) -> bool {
     shared > preview.len() / 2
 }
 
+#[cfg(test)]
 pub fn field_write(source: &str, preview: &str, origin: usize, incoming: &str) -> FieldWrite {
     if incoming == preview {
         return FieldWrite::Echo;
@@ -158,6 +187,7 @@ pub fn window_message(full_bytes: usize, line: u32) -> String {
     )
 }
 
+#[cfg(test)]
 fn window_origin(full: &str, start: usize, end: usize) -> usize {
     let line = line_start(full, start);
     if take_window(full, line) >= end {
@@ -167,14 +197,17 @@ fn window_origin(full: &str, start: usize, end: usize) -> usize {
     start
 }
 
+#[cfg(test)]
 fn line_start(full: &str, at: usize) -> usize {
     full[..at].rfind('\n').map(|index| index + 1).unwrap_or(0)
 }
 
+#[cfg(test)]
 fn line_number(full: &str, at: usize) -> u32 {
     (full[..at].bytes().filter(|byte| *byte == b'\n').count() + 1) as u32
 }
 
+#[cfg(test)]
 fn take_window(full: &str, origin: usize) -> usize {
     let mut units = 0usize;
     let mut lines = 1usize;
@@ -194,6 +227,7 @@ fn take_window(full: &str, origin: usize) -> usize {
     full.len()
 }
 
+#[cfg(test)]
 fn floor_char(text: &str, mut index: usize) -> usize {
     if index > text.len() {
         index = text.len();
@@ -204,6 +238,7 @@ fn floor_char(text: &str, mut index: usize) -> usize {
     index
 }
 
+#[cfg(test)]
 fn preview_end(full: &str) -> usize {
     let mut units = 0usize;
     let mut lines = 1usize;
@@ -221,10 +256,6 @@ fn preview_end(full: &str) -> usize {
         }
     }
     full.len()
-}
-
-pub fn utf16_len(text: &str) -> usize {
-    text.chars().map(char::len_utf16).sum()
 }
 
 pub fn format_bytes(bytes: usize) -> String {

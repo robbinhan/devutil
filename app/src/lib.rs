@@ -1,8 +1,8 @@
-//! DevUtil workbench on Native Shell 0.1.1.
+//! DevUtil workbench on Native Shell 0.3.0.
 //!
 //! The tools call `json_core`, `timestamp_core`, `url_codec_core`,
-//! `hash_core`, `markdown_core`, and `diff_core` directly. `App.tsx` mounts
-//! this same `App` when `nsh run` hosts the TSX entry.
+//! `hash_core`, `markdown_core`, and `diff_core` directly. `nsh.json`
+//! names this `App` as the root. `App.tsx` can still mount it.
 
 mod chrome;
 mod diff_model;
@@ -13,6 +13,7 @@ mod hash_tool;
 mod json_model;
 mod json_tool;
 mod markdown_tool;
+mod palette;
 mod search_ui;
 mod timestamp_model;
 mod timestamp_tool;
@@ -24,13 +25,14 @@ use hash_tool::HashState;
 use json_tool::JsonState;
 use markdown_tool::MarkdownState;
 use nsh_core::keymap::When;
-use nsh_core::ui::prelude::*;
+use nsh_base::theme;
+use nsh_core::prelude::*;
 use timestamp_tool::TimestampState;
 use url_tool::UrlState;
 
-/// Light and dark palettes, loaded from `theme.json`.
-pub fn app_theme() -> Theme {
-    Theme::from_json(include_str!("theme.json")).expect("DevUtil theme")
+/// Light and dark palettes, loaded from `theme.json` (shadcn `cssVars`).
+pub fn app_theme() -> nsh_base::Theme {
+    nsh_base::Theme::from_json(include_str!("theme.json")).expect("DevUtil theme")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +205,7 @@ fn find_keys(
         Tool::Markdown => markdown.search.open.get(),
         Tool::Diff => false,
     });
-    If::new(open, move || {
+    when(open, move || {
         let always = KeyOptions {
             when: When::Always,
             repeat: true,
@@ -453,7 +455,7 @@ mod tests {
     #[test]
     fn theme_file_loads() {
         let theme = app_theme();
-        assert_eq!(theme.radius, 12.0);
+        assert_eq!(theme.radius, px(12.0));
         assert_ne!(theme.background.light, theme.background.dark);
         assert_ne!(theme.foreground.light, theme.foreground.dark);
     }

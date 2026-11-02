@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hash_core::{DigestRow, matching_labels};
 
-use crate::json_model::{self, FieldPreview, field_text};
+use crate::json_model;
 
 /// Wait after a keystroke before hashing. Huge input is not hashed on every
 /// change, and anything past [`INLINE_LIMIT`] also leaves the engine thread.
@@ -41,8 +41,9 @@ pub fn hash_inline(len: usize) -> bool {
 }
 
 /// The prefix the text view may show. Hashing uses the full string.
-pub fn displayed_input(full: &str) -> FieldPreview {
-    field_text(full)
+#[cfg(test)]
+pub fn displayed_input(full: &str) -> json_model::FieldPreview {
+    json_model::field_text(full)
 }
 
 pub fn cap_message(full_bytes: usize, preview_bytes: usize) -> String {

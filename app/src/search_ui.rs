@@ -3,8 +3,12 @@
 
 use crate::chrome;
 use crate::find::{PieceKind, SnippetPiece, TextSearch};
-use crate::json_model::{self, reveal_match};
-use nsh_core::ui::prelude::*;
+use nsh_base::theme;
+use nsh_base::{input, Editor, EditorApi, EditorPosition, EditorSearch, EditorSelection};
+use nsh_core::prelude::*;
+
+/// Handle of a workbench [`Editor`].
+pub type EditorHandle = ComponentRef<Editor>;
 
 pub fn bar(
     search: TextSearch,
@@ -24,7 +28,7 @@ pub fn bar(
         .py(px(6.0))
         .gap(px(6.0))
         .rounded(px(12.0))
-        .bg(move || theme().group_box)
+        .bg(move || theme().card)
         .border_1()
         .border_color(move || theme().border)
         .child(
@@ -44,7 +48,7 @@ pub fn bar(
                         .text_xs()
                         .text_color(move || {
                             if search.error.with(|error| !error.is_empty()) {
-                                theme().danger
+                                crate::palette::danger()
                             } else {
                                 theme().muted_foreground
                             }
@@ -70,10 +74,10 @@ fn query_field(
         .text_color(move || theme().foreground)
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
-        .blur_on_submit(false)
+        .submit_behavior(SubmitBehavior::Submit)
         .element_ref(query_ref)
         .test_id("find-query")
-        .on_change_text(move |text: &str| on_edit(text.to_string()))
+        .on_change(move |text: &str| on_edit(text.to_string()))
         .flex_1()
         .min_w(px(120.0))
         .h(px(28.0))
@@ -165,15 +169,46 @@ pub fn watch_focus(search: TextSearch, query_ref: ElementRef) {
     });
 }
 
-pub fn select_later(editor: ElementRef, start: u32, end: u32) {
+/// The find query, when find is open and the query is not empty. The
+/// editor paints every match and scrolls the one the selection covers.
+pub fn editor_query(search: TextSearch) -> Option<EditorSearch> {
+    if !search.open.get() {
+        return None;
+    }
+    let query = search.query.get();
+    if query.is_empty() {
+        return None;
+    }
+    let mut found = EditorSearch::new(query);
+    found.case_sensitive = search.case_sensitive.get();
+    found.regex = search.regex.get();
+    Some(found)
+}
+
+/// Select `start..end` (byte offsets into `text`) and scroll that range
+/// into view. The find field keeps the keyboard focus: this does not
+/// focus the editor unless `focus` is set.
+pub fn reveal_in_editor(editor: EditorHandle, text: &str, start: usize, end: usize, focus: bool) {
+    let anchor = editor_point(text, start);
+    let head = editor_point(text, end);
     spawn(async move {
         next_frame().await;
-        editor.set_selection(start, end);
+        let Some(api) = editor.api::<EditorApi>() else {
+            return;
+        };
+        api.set_selections(vec![EditorSelection::new(anchor, head)]);
+        if focus {
+            api.focus();
+        }
     });
 }
 
-/// Plain ink for a run that is not the current match. Text runs cannot
-/// carry a background, so a hit is a foreground color and a weight.
+fn editor_point(text: &str, byte: usize) -> EditorPosition {
+    let point = crate::find::point_at(text, byte);
+    EditorPosition::new(point.line, point.column)
+}
+
+/// Plain ink for a run that is not the current match.
 #[derive(Clone, Copy)]
 pub enum Ink {
     Foreground,
@@ -187,15 +222,15 @@ pub fn ink_color(ink: Ink) -> AdaptiveColor {
     match ink {
         Ink::Foreground => theme().foreground,
         Ink::Muted => theme().muted_foreground,
-        Ink::Success => theme().success,
+        Ink::Success => crate::palette::success(),
         Ink::Primary => theme().primary,
-        Ink::Info => theme().info,
+        Ink::Info => crate::palette::info(),
     }
 }
 
-/// One line of a match. The current hit is semibold in the primary color.
-/// Other hits on that line use the info color. NSH has no background on a
-/// text run, so the row behind the current line carries the tint.
+/// One line of a match. The current hit is semibold on a primary tint.
+/// Other hits on that line use the info color and a lighter tint. The row
+/// behind the current line is tinted as well.
 pub fn piece_line(pieces: Vec<SnippetPiece>, plain: Ink) -> Text {
     let mut line = text("")
         .font_family(chrome::MONO)
@@ -208,11 +243,16 @@ pub fn piece_line(pieces: Vec<SnippetPiece>, plain: Ink) -> Text {
             .text_size(px(12.5))
             .text_color(move || match kind {
                 PieceKind::Current => theme().primary,
-                PieceKind::Hit => theme().info,
+                PieceKind::Hit => crate::palette::info(),
                 PieceKind::Plain => ink_color(plain),
             });
         if kind == PieceKind::Current {
-            span = span.font_weight(FontWeight::SEMIBOLD);
+            span = span
+                .font_weight(FontWeight::SEMIBOLD)
+                .rounded(px(2.0))
+                .bg(move || theme().primary.opacity(0.22));
+        } else if kind == PieceKind::Hit {
+            span = span.rounded(px(2.0)).bg(move || crate::palette::info().opacity(0.18));
         }
         line = line.child(span);
     }
@@ -242,12 +282,12 @@ fn snippet_list(search: TextSearch) -> impl IntoElement {
                     .rounded(px(8.0))
                     .bg(move || {
                         if active {
-                            theme().list_active
+                            crate::palette::list_active()
                         } else {
                             AdaptiveColor::TRANSPARENT
                         }
                     })
-                    .hover(|style| style.bg(move || theme().list_head))
+                    .hover(|style| style.bg(move || crate::palette::list_head()))
                     .role(AccessibilityRole::Button)
                     .label(format!("Match on line {line_no}"))
                     .on_press(move |_: &()| {
@@ -269,42 +309,24 @@ fn snippet_list(search: TextSearch) -> impl IntoElement {
     })
 }
 
-/// Replace `field` so the current match is the first line, and publish the
-/// styled rows. Used for documents that are not already split into a preview
-/// by the JSON or Hash tools (URL, Timestamp, Markdown).
-pub fn watch_windowed_field(
-    search: TextSearch,
-    source: Signal<String>,
-    field: Signal<String>,
-    origin: Signal<usize>,
-    line: Signal<u32>,
-    capped: Signal<bool>,
-    editor: ElementRef,
-) {
+/// Publish the rows under the find bar and scroll the current match into
+/// view inside `editor`. The editor keeps the whole document.
+pub fn watch_editor(search: TextSearch, source: Signal<String>, editor: EditorHandle) {
     effect(move || {
         let _ = search.revision.get();
         let _ = search.index.get();
         untracked(|| {
             if !search.open.get() {
+                search.snippets.set(Vec::new());
                 return;
             }
             let Some(hit) = search.current() else {
                 search.snippets.set(Vec::new());
-                let shown = source.with(|text| json_model::field_text(text));
-                origin.set(0);
-                line.set(0);
-                capped.set(shown.capped);
-                field.set(shown.text);
                 return;
             };
             let full = source.get();
-            let revealed = reveal_match(&full, hit.start, hit.end);
-            origin.set(revealed.preview.byte_start);
-            line.set(revealed.line);
-            capped.set(revealed.preview.capped);
-            field.set(revealed.preview.text);
             search.publish_snippets(&full);
-            select_later(editor.clone(), revealed.utf16_start, revealed.utf16_end);
+            reveal_in_editor(editor, &full, hit.start, hit.end, false);
         });
     });
 }

@@ -10,10 +10,11 @@ use crate::search_ui;
 
 const SAMPLE: &str = "{\n  \"ok\": true,\n  \"name\": \"DevUtil\",\n  \"count\": 3\n}";
 use crate::json_model::{
-    self, OutputMode, TreeRow, cap_message, field_text, filtered_tree_rows, output_text,
-    reveal_match, severity_name, tree_rows, window_message,
+    self, OutputMode, TreeRow, cap_message, filtered_tree_rows, output_text, severity_name,
+    tree_rows, window_message,
 };
-use nsh_core::ui::prelude::*;
+use nsh_base::theme;
+use nsh_core::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FindTarget {
@@ -79,11 +80,11 @@ impl JsonState {
     }
 
     pub fn publish_source(self, text: String) {
-        let shown = field_text(&text);
+        let text = json_model::normalize_newlines(text);
         self.field_origin.set(0);
         self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        self.field_capped.set(false);
+        self.field.set(text.clone());
         self.source.set(text);
         if self.search.open.get() {
             self.schedule_search();
@@ -132,19 +133,19 @@ impl JsonState {
     }
 
     fn restore_input(self) {
-        let shown = self.source.with(|text| field_text(text));
         self.field_origin.set(0);
         self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        self.field_capped.set(false);
+        let text = self.source.get();
+        self.field.set(text);
     }
 
     fn restore_output(self) {
-        let shown = self.formatted.with(|text| field_text(text));
         self.output_origin.set(0);
         self.output_line.set(0);
-        self.output_capped.set(!self.formatted.with(String::is_empty) && shown.capped);
-        self.output_field.set(shown.text);
+        self.output_capped.set(false);
+        let text = self.formatted.get();
+        self.output_field.set(text);
     }
 
     fn publish_find_label(self) {
@@ -176,48 +177,12 @@ impl JsonState {
         self.search.label.set(label);
     }
 
-    /// A keystroke in the field. The view never holds more than the preview,
-    /// so a large paste arrives clipped; the clipboard still has the rest.
+    /// A keystroke in the editor. The editor holds the whole document.
     pub fn on_field(self, text: String) {
-        if self.field.with(|current| current == &text) {
+        if self.source.with(|current| current == &text) {
             return;
         }
-        let origin = self.field_origin.get();
-        let capped = self.field_capped.get();
-        let preview = self.field.get();
-        if (capped || origin > 0) && is_preview_edit(&preview, &text) {
-            // Put the preview back. The full document stays in `source`.
-            self.field.update(|_| {});
-            return;
-        }
-        if origin == 0 && json_model::utf16_len(&text) + 8 >= json_model::FIELD_LIMIT {
-            self.recover_clipboard(text);
-            return;
-        }
-        if origin == 0 {
-            self.publish_source(text);
-            return;
-        }
-        let Some(spliced) = self
-            .source
-            .with(|source| json_model::splice_window(source, origin, preview.len(), &text))
-        else {
-            self.field.update(|_| {});
-            return;
-        };
-        self.publish_source(spliced);
-    }
-
-    fn recover_clipboard(self, clipped: String) {
-        self.field.set(clipped.clone());
-        spawn(async move {
-            let clip = clipboard_string().await;
-            if clip.len() > clipped.len().saturating_add(8) && clip.starts_with(&clipped) {
-                self.publish_source(clip);
-            } else {
-                self.publish_source(clipped);
-            }
-        });
+        self.publish_source(text);
     }
 
     pub fn analyze(self, mode: OutputMode) {
@@ -257,12 +222,12 @@ impl JsonState {
             }
             return;
         };
-        let shown = field_text(&full);
+        let full = json_model::normalize_newlines(full);
         self.output_origin.set(0);
         self.output_line.set(0);
-        self.formatted.set(full);
-        self.output_field.set(shown.text);
-        self.output_capped.set(shown.capped);
+        self.formatted.set(full.clone());
+        self.output_field.set(full);
+        self.output_capped.set(false);
         self.has_output.set(true);
         if self.search.open.get() {
             self.schedule_search();
@@ -307,18 +272,6 @@ impl JsonState {
     }
 }
 
-fn is_preview_edit(preview: &str, incoming: &str) -> bool {
-    if incoming.is_empty() || preview.is_empty() {
-        return false;
-    }
-    let shared = preview
-        .bytes()
-        .zip(incoming.bytes())
-        .take_while(|(left, right)| left == right)
-        .count();
-    shared > preview.len() / 2
-}
-
 pub fn toolbar_buttons(state: JsonState, copied: Signal<Option<String>>) -> impl IntoElement {
     view()
         .flex_none()
@@ -343,8 +296,8 @@ pub fn toolbar_buttons(state: JsonState, copied: Signal<Option<String>>) -> impl
 }
 
 pub fn body(state: JsonState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
-    let editor = element_ref();
-    let output_editor = element_ref();
+    let editor = component_ref::<nsh_base::Editor>();
+    let output_editor = component_ref::<nsh_base::Editor>();
     let tree_list = element_ref();
     let query_ref = element_ref();
     install_search(state, editor.clone(), output_editor.clone(), tree_list.clone(), query_ref.clone());
@@ -391,8 +344,8 @@ pub fn body(state: JsonState, copied: Signal<Option<String>>, shortcut: String) 
 
 fn install_search(
     state: JsonState,
-    input: ElementRef,
-    output: ElementRef,
+    input: search_ui::EditorHandle,
+    output: search_ui::EditorHandle,
     tree_list: ElementRef,
     query_ref: ElementRef,
 ) {
@@ -427,7 +380,7 @@ fn install_search(
             let tree_list = tree_list.clone();
             spawn(async move {
                 next_frame().await;
-                tree_list.scroll_to_index(cursor as u32, 0.25, 0.0, false);
+                tree_list.scroll_to_index(cursor as u32, percentage(0.25), px(0.0), false);
             });
         });
     });
@@ -486,19 +439,17 @@ fn refresh_tree(state: JsonState) {
     state.publish_find_label();
 }
 
-fn reveal(state: JsonState, input: ElementRef, output: ElementRef) {
+fn reveal(
+    state: JsonState,
+    input: search_ui::EditorHandle,
+    output: search_ui::EditorHandle,
+) {
     if state.find_target.get() == FindTarget::Tree {
-        state.restore_input();
-        state.restore_output();
         state.search.snippets.set(Vec::new());
         return;
     }
     let Some(hit) = state.search.current() else {
         state.search.snippets.set(Vec::new());
-        match state.find_target.get() {
-            FindTarget::Result => state.restore_output(),
-            FindTarget::Input | FindTarget::Tree => state.restore_input(),
-        }
         return;
     };
     let target = state.find_target.get();
@@ -506,21 +457,13 @@ fn reveal(state: JsonState, input: ElementRef, output: ElementRef) {
         FindTarget::Result => state.formatted.get(),
         FindTarget::Input | FindTarget::Tree => state.source.get(),
     };
-    let revealed = reveal_match(&full, hit.start, hit.end);
-    if target == FindTarget::Result {
-        state.output_origin.set(revealed.preview.byte_start);
-        state.output_line.set(revealed.line);
-        state.output_capped.set(revealed.preview.capped);
-        state.output_field.set(revealed.preview.text);
-        search_ui::select_later(output, revealed.utf16_start, revealed.utf16_end);
-    } else {
-        state.field_origin.set(revealed.preview.byte_start);
-        state.field_line.set(revealed.line);
-        state.field_capped.set(revealed.preview.capped);
-        state.field.set(revealed.preview.text);
-        search_ui::select_later(input, revealed.utf16_start, revealed.utf16_end);
-    }
     state.search.publish_snippets(&full);
+    let editor = if target == FindTarget::Result {
+        output
+    } else {
+        input
+    };
+    search_ui::reveal_in_editor(editor, &full, hit.start, hit.end, false);
 }
 
 fn page_header(state: JsonState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
@@ -560,10 +503,10 @@ fn json_badge(state: JsonState) -> impl IntoElement {
             })
         });
         match kind {
-            Some(Badge::Valid) => chrome::badge("Valid", theme().success).into_element(),
-            Some(Badge::Recovered) => chrome::badge("Recovered", theme().warning).into_element(),
-            Some(Badge::Review) => chrome::badge("Review", theme().info).into_element(),
-            Some(Badge::Invalid) => chrome::badge("Invalid", theme().danger).into_element(),
+            Some(Badge::Valid) => chrome::badge("Valid", crate::palette::success()).into_element(),
+            Some(Badge::Recovered) => chrome::badge("Recovered", crate::palette::warning()).into_element(),
+            Some(Badge::Review) => chrome::badge("Review", crate::palette::info()).into_element(),
+            Some(Badge::Invalid) => chrome::badge("Invalid", crate::palette::danger()).into_element(),
             None => view().into_element(),
         }
     })
@@ -577,7 +520,8 @@ enum Badge {
     Invalid,
 }
 
-fn input_pane(state: JsonState, editor: ElementRef) -> impl IntoElement {
+fn input_pane(state: JsonState, editor: search_ui::EditorHandle) -> impl IntoElement {
+    let search = state.search;
     column_pane()
         .child(input_header(state))
         .child(cap_note(
@@ -588,15 +532,19 @@ fn input_pane(state: JsonState, editor: ElementRef) -> impl IntoElement {
             state.field_line,
         ))
         .child(
-            chrome::mono_field(
-                state.field,
+            chrome::mono_editor(
+                state.source,
                 "Paste JSON, or something close to it",
                 true,
-                true,
+                move || {
+                    if state.find_target.get() != FindTarget::Input {
+                        return None;
+                    }
+                    search_ui::editor_query(search)
+                },
                 move |text| state.on_field(text),
             )
-            .element_ref(&editor)
-            .test_id("json-input")
+            .component_ref(&editor)
             .flex_1()
             .min_h(px(160.0)),
         )
@@ -631,7 +579,7 @@ fn cap_note(
             return view().child(
                 text(message)
                     .text_xs()
-                    .text_color(move || theme().warning),
+                    .text_color(move || crate::palette::warning()),
             );
         }
         if !show.get() {
@@ -641,7 +589,7 @@ fn cap_note(
         view().child(
             text(message)
                 .text_xs()
-                .text_color(move || theme().warning),
+                .text_color(move || crate::palette::warning()),
         )
     })
 }
@@ -649,8 +597,8 @@ fn cap_note(
 fn result_pane(
     state: JsonState,
     copied: Signal<Option<String>>,
-    editor: ElementRef,
-    output_editor: ElementRef,
+    editor: search_ui::EditorHandle,
+    output_editor: search_ui::EditorHandle,
     tree_list: ElementRef,
     shortcut: String,
 ) -> impl IntoElement {
@@ -697,8 +645,8 @@ fn result_header(state: JsonState) -> impl IntoElement {
 
 fn banner_and_output(
     state: JsonState,
-    editor: ElementRef,
-    output_editor: ElementRef,
+    editor: search_ui::EditorHandle,
+    output_editor: search_ui::EditorHandle,
     shortcut: String,
 ) -> impl IntoElement {
     dynamic(move || {
@@ -742,7 +690,7 @@ fn empty_result(state: JsonState, shortcut: String) -> View {
     }
 }
 
-fn notes(state: JsonState, diagnostics: Vec<Diagnostic>, editor: ElementRef) -> impl IntoElement {
+fn notes(state: JsonState, diagnostics: Vec<Diagnostic>, editor: search_ui::EditorHandle) -> impl IntoElement {
     let mut card = chrome::card().child(chrome::section("Notes"));
     for diagnostic in diagnostics {
         let tint = tint_for(&diagnostic);
@@ -753,8 +701,8 @@ fn notes(state: JsonState, diagnostics: Vec<Diagnostic>, editor: ElementRef) -> 
 
 fn tint_for(diagnostic: &Diagnostic) -> AdaptiveColor {
     match diagnostic.severity {
-        json_core::DiagnosticSeverity::Error => theme().danger,
-        json_core::DiagnosticSeverity::Warning => theme().warning,
+        json_core::DiagnosticSeverity::Error => crate::palette::danger(),
+        json_core::DiagnosticSeverity::Warning => crate::palette::warning(),
         json_core::DiagnosticSeverity::Info => theme().muted_foreground,
     }
 }
@@ -763,7 +711,7 @@ fn diagnostic_row(
     state: JsonState,
     diagnostic: Diagnostic,
     tint: AdaptiveColor,
-    editor: ElementRef,
+    editor: search_ui::EditorHandle,
 ) -> impl IntoElement {
     let line = format!(
         "{} · {} · line {}, column {}",
@@ -783,27 +731,17 @@ fn diagnostic_row(
         )
 }
 
-fn select_range(state: JsonState, editor: &ElementRef, range: Option<SourceRange>) {
+fn select_range(state: JsonState, editor: &search_ui::EditorHandle, range: Option<SourceRange>) {
     let Some(range) = range else {
         return;
     };
     let full = state.source.get();
     let start = find::byte_at_utf16(&full, range.utf16_start);
     let end = find::byte_at_utf16(&full, range.utf16_end);
-    let revealed = reveal_match(&full, start, end);
-    state.field_origin.set(revealed.preview.byte_start);
-    state.field_line.set(revealed.line);
-    state.field_capped.set(revealed.preview.capped);
-    state.field.set(revealed.preview.text);
-    search_ui::select_later(editor.clone(), revealed.utf16_start, revealed.utf16_end);
-    let editor = editor.clone();
-    spawn(async move {
-        next_frame().await;
-        editor.focus();
-    });
+    search_ui::reveal_in_editor(*editor, &full, start, end, true);
 }
 
-fn output_block(state: JsonState, output_editor: ElementRef) -> impl IntoElement {
+fn output_block(state: JsonState, output_editor: search_ui::EditorHandle) -> impl IntoElement {
     view()
         .w_full()
         .gap(px(6.0))
@@ -814,15 +752,26 @@ fn output_block(state: JsonState, output_editor: ElementRef) -> impl IntoElement
             state.output_origin,
             state.output_line,
         ))
-        .child(output_field(state.output_field, output_editor))
+        .child(output_field(state, output_editor))
 }
 
-fn output_field(value: Signal<String>, output_editor: ElementRef) -> impl IntoElement {
-    chrome::mono_field(value, "", true, false, |_| {})
-        .element_ref(&output_editor)
-        .test_id("json-output")
-        .h(px(220.0))
-        .w_full()
+fn output_field(state: JsonState, output_editor: search_ui::EditorHandle) -> impl IntoElement {
+    let search = state.search;
+    chrome::mono_editor(
+        state.formatted,
+        "",
+        false,
+        move || {
+            if state.find_target.get() != FindTarget::Result {
+                return None;
+            }
+            search_ui::editor_query(search)
+        },
+        |_| {},
+    )
+    .component_ref(&output_editor)
+    .h(px(220.0))
+    .w_full()
 }
 
 fn tree_section(
@@ -887,7 +836,7 @@ fn tree_section(
                 })
                 .element_ref(&tree_list)
                 .keys(move || keys.iter().map(|row| row.id.clone()).collect::<Vec<_>>())
-                .estimated_item_size(28.0)
+                .estimated_item_size(px(28.0))
                 .h(px(280.0))
                 .w_full(),
             );
@@ -942,14 +891,14 @@ fn tree_row(
         .bg(move || {
             let matched = tint_rows.get(at.index()).is_some_and(|row| row.matched);
             if matched && cursor.get() == at.index() {
-                theme().list_active
+                crate::palette::list_active()
             } else if matched {
-                theme().selection
+                theme().selection()
             } else {
                 AdaptiveColor::TRANSPARENT
             }
         })
-        .hover(|style| style.bg(move || theme().list_head))
+        .hover(|style| style.bg(move || crate::palette::list_head()))
         .child(
             text(move || {
                 let depth = depth_rows.get(at.index()).map(|row| row.depth).unwrap_or(0);

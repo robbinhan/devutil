@@ -4,8 +4,9 @@
 //! short glyphs in the system font. `ui-monospace` is SF Mono on macOS
 //! (the system monospaced face) and the platform monospace face on Linux.
 
-use crate::json_model::{self, FIELD_LIMIT};
-use nsh_core::ui::prelude::*;
+use crate::json_model;
+use nsh_base::{input, theme};
+use nsh_core::prelude::*;
 
 /// Platform monospace. On macOS, NSH maps this to the system monospaced font.
 pub const MONO: &str = "ui-monospace";
@@ -33,7 +34,7 @@ pub fn action_button(
         .hover(|style| {
             style.bg(move || {
                 if primary {
-                    theme().primary_active
+                    crate::palette::primary_active()
                 } else {
                     theme().muted
                 }
@@ -75,7 +76,7 @@ where
         .rounded(px(7.0))
         .bg(move || {
             if current.get() == selected {
-                theme().group_box
+                theme().card
             } else {
                 AdaptiveColor::TRANSPARENT
             }
@@ -135,7 +136,7 @@ pub fn card() -> View {
         .p(px(12.0))
         .gap(px(8.0))
         .rounded(px(12.0))
-        .bg(move || theme().group_box)
+        .bg(move || theme().card)
         .border_1()
         .border_color(move || theme().border)
         .shadow_xs()
@@ -275,7 +276,7 @@ pub fn copy_button(
             .font_weight(FontWeight::MEDIUM)
             .text_color(move || {
                 if copied.get().as_deref() == Some(shown_color.as_str()) {
-                    theme().success
+                    crate::palette::success()
                 } else {
                     theme().muted_foreground
                 }
@@ -323,7 +324,7 @@ pub fn copy_icon(
             .text_sm()
             .text_color(move || {
                 if copied.get().as_deref() == Some(shown_color.as_str()) {
-                    theme().success
+                    crate::palette::success()
                 } else {
                     theme().muted_foreground
                 }
@@ -390,11 +391,9 @@ where
         )
 }
 
-/// Monospace field. Multiline uses AppKit's `NSTextView` (a scroll view);
-/// a single line uses `NSTextField`. `editable == false` stays selectable.
-///
-/// The view is capped at [`FIELD_LIMIT`] UTF-16 units. Callers that need
-/// the rest of a paste keep it outside this value.
+/// Monospace native field. Multiline is the platform text view, used for
+/// short results that are not the find editor. The find editors are
+/// [`mono_editor`].
 pub fn mono_field(
     value: impl IntoReactive<String>,
     placeholder: &'static str,
@@ -413,18 +412,59 @@ pub fn mono_field(
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .multiline(multiline)
-        .editable(editable)
+        .readonly(!editable)
         .value(value)
         .p(px(12.0))
         .rounded(px(12.0))
-        .bg(move || theme().group_box)
+        .bg(move || theme().card)
         .border_1()
         .border_color(move || theme().border);
-    if multiline {
-        field = field.max_length(FIELD_LIMIT as u32);
-    }
     if editable {
-        field = field.on_change_text(move |text: &str| on_change(text.to_string()));
+        field = field.on_change(move |text: &str| on_change(text.to_string()));
+    } else {
+        drop(on_change);
+    }
+    field
+}
+
+/// Multiline monospace editor. NSH 0.3's `Editor` draws the text itself
+/// and only builds the rows on screen, so the document is not clipped to
+/// the old 32,768-unit text view. `search` highlights matches inside the
+/// text; `read_only` stays selectable.
+pub fn mono_editor(
+    value: Signal<String>,
+    placeholder: &'static str,
+    editable: bool,
+    search: impl Fn() -> Option<nsh_base::EditorSearch> + 'static,
+    on_change: impl Fn(String) + 'static,
+) -> nsh_base::EditorElement {
+    let mut classes = nsh_base::EditorClasses::default();
+    classes.content = Some("px-3 py-3".into());
+    classes.search_match = Some("bg-info/28".into());
+    classes.current_search_match = Some("bg-primary/45".into());
+    let mut field = nsh_base::editor()
+        .value(move || Some(SharedString::from(value.get())))
+        .placeholder(Some(SharedString::from(placeholder)))
+        .read_only(!editable)
+        .line_numbers(false)
+        .folding(false)
+        .active_line(false)
+        .indent_guides(false)
+        .highlighting(false)
+        .auto_close(false)
+        .auto_indent(false)
+        .soft_wrap(true)
+        .font_family(Some(SharedString::from(MONO)))
+        .font_size(px(13.0))
+        .line_height(px(20.0))
+        .search(search)
+        .classes(classes)
+        .rounded(px(12.0))
+        .bg(move || theme().card)
+        .border_1()
+        .border_color(move || theme().border);
+    if editable {
+        field = field.on_change(move |text: &SharedString| on_change(text.to_string()));
     } else {
         drop(on_change);
     }

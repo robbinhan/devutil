@@ -1,10 +1,8 @@
-//! Text compare. Two capped editors (Original, Changed) feed `diff_core`;
+//! Text compare. Two editors (Original, Changed) feed `diff_core`;
 //! the result is a virtual list in a side-by-side or unified layout.
 //!
-//! NSH 0.1.1 text runs have a foreground color and a weight but no
-//! background, so a changed line is a tinted row behind the text, a `+` or
-//! `-` marker, and a colored run. Words that changed inside a line are
-//! semibold and underlined.
+//! A changed line is a tinted row, a `+` or `-` marker, and a colored run.
+//! Words that changed inside a line get their own background.
 
 use std::time::Duration;
 
@@ -12,8 +10,9 @@ use diff_core::{Cell, Comparison, Layout, Options, SideRow, Span, Tag, UnifiedRo
 
 use crate::chrome::{self, column_pane};
 use crate::diff_model::{self, INLINE_BYTES, MAX_BYTES, ROW_CAP, plural};
-use crate::json_model::{self, FIELD_LIMIT, field_text};
-use nsh_core::ui::prelude::*;
+use crate::json_model;
+use nsh_base::theme;
+use nsh_core::prelude::*;
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
 const ROW_HEIGHT: f32 = 22.0;
@@ -46,32 +45,18 @@ impl Side {
     }
 
     fn publish(self, text: String) {
-        let shown = field_text(&text);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        let text = json_model::normalize_newlines(text);
+        self.field_capped.set(false);
+        self.field.set(text.clone());
         self.source.set(text);
     }
 
-    /// A keystroke in the text view. When the view shows only a prefix,
-    /// the edit is spliced back so the hidden tail survives.
+    /// A keystroke in the editor. The editor holds the whole side.
     fn write(self, text: String) -> bool {
-        let preview = self.field.get();
-        if text == preview {
+        if self.source.with(|full| full == &text) {
             return false;
         }
-        let next = if self.field_capped.get() {
-            self.source
-                .with(|full| json_model::splice_window(full, 0, preview.len(), &text))
-        } else {
-            None
-        };
-        match next {
-            Some(full) => {
-                self.field.set(text);
-                self.source.set(full);
-            }
-            None => self.publish(text),
-        }
+        self.publish(text);
         true
     }
 }
@@ -138,30 +123,9 @@ impl DiffState {
 
     fn on_field(self, right: bool, text: String) {
         let side = self.side(right);
-        let clipped = json_model::utf16_len(&text) + 8 >= FIELD_LIMIT && !side.field_capped.get();
-        if clipped {
-            self.recover_clipboard(right, text);
-            return;
-        }
         if side.write(text) {
             self.schedule();
         }
-    }
-
-    /// A paste longer than the text view is cut at its limit. When the
-    /// clipboard holds the full text, use that instead.
-    fn recover_clipboard(self, right: bool, clipped: String) {
-        let side = self.side(right);
-        side.field.set(clipped.clone());
-        spawn(async move {
-            let clip = clipboard_string().await;
-            if clip.len() > clipped.len().saturating_add(8) && clip.starts_with(&clipped) {
-                side.publish(clip);
-            } else {
-                side.publish(clipped);
-            }
-            self.schedule();
-        });
     }
 
     /// Debounced compare of whatever both sides hold when the timer fires.
@@ -576,7 +540,7 @@ fn option_flag(
 
 fn editor_pane(state: DiffState, right: bool) -> impl IntoElement {
     let side = state.side(right);
-    let (label, placeholder, id) = if right {
+    let (label, placeholder, _id) = if right {
         ("Changed", "Paste the changed text", "diff-changed")
     } else {
         ("Original", "Paste the original text", "diff-original")
@@ -649,14 +613,17 @@ fn editor_pane(state: DiffState, right: bool) -> impl IntoElement {
             });
             text(message)
                 .text_xs()
-                .text_color(move || theme().warning)
+                .text_color(move || crate::palette::warning())
                 .into_element()
         }))
         .child(
-            chrome::mono_field(side.field, placeholder, true, true, move |text| {
-                state.on_field(right, text);
-            })
-            .test_id(id)
+            chrome::mono_editor(
+                side.source,
+                placeholder,
+                true,
+                || None,
+                move |text| state.on_field(right, text),
+            )
             .flex_1()
             .min_h(px(100.0)),
         )
@@ -691,14 +658,14 @@ fn summary_row(state: DiffState) -> impl IntoElement {
             };
             if summary.identical() {
                 let label = if exact { "Identical" } else { "Equivalent" };
-                return count_pill(label.to_string(), theme().success).into_element();
+                return count_pill(label.to_string(), crate::palette::success()).into_element();
             }
             view()
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .child(count_pill(format!("+{}", summary.added), theme().success))
-                .child(count_pill(format!("−{}", summary.removed), theme().danger))
+                .child(count_pill(format!("+{}", summary.added), crate::palette::success()))
+                .child(count_pill(format!("−{}", summary.removed), crate::palette::danger()))
                 .child(
                     text(format!(
                         "{} · {} → {}",
@@ -756,7 +723,7 @@ fn notice_line(state: DiffState) -> impl IntoElement {
         {
             return text(error)
                 .text_xs()
-                .text_color(move || theme().danger)
+                .text_color(move || crate::palette::danger())
                 .into_element();
         }
         if state
@@ -768,7 +735,7 @@ fn notice_line(state: DiffState) -> impl IntoElement {
                 ROW_CAP
             ))
             .text_xs()
-            .text_color(move || theme().warning)
+            .text_color(move || crate::palette::warning())
             .into_element();
         }
         view().into_element()
@@ -826,13 +793,13 @@ fn result_body(state: DiffState) -> impl IntoElement {
         Body::Identical => chrome::state_card(
             "Identical",
             "Both sides are the same text.",
-            theme().success,
+            crate::palette::success(),
         )
         .into_element(),
         Body::Equivalent => chrome::state_card(
             "No changes",
             "The sides match under the current options (whitespace, case, or JSON format).",
-            theme().success,
+            crate::palette::success(),
         )
         .into_element(),
         Body::Rows(ViewMode::Split) => split_list(state).into_element(),
@@ -876,7 +843,7 @@ fn split_list(state: DiffState) -> impl IntoElement {
         })
     })
     .keys(move || row_keys(state, count()))
-    .estimated_item_size(ROW_HEIGHT)
+    .estimated_item_size(px(ROW_HEIGHT))
     .flex_1()
     .min_h(px(0.0))
     .w_full()
@@ -947,7 +914,7 @@ fn unified_list(state: DiffState) -> impl IntoElement {
         })
     })
     .keys(move || row_keys(state, count()))
-    .estimated_item_size(ROW_HEIGHT)
+    .estimated_item_size(px(ROW_HEIGHT))
     .flex_1()
     .min_h(px(0.0))
     .w_full()
@@ -958,17 +925,25 @@ fn unified_list(state: DiffState) -> impl IntoElement {
 /// other side has no line, nothing for an unchanged line.
 fn row_tint(tag: Option<Tag>) -> AdaptiveColor {
     match tag {
-        Some(Tag::Delete) => theme().danger.opacity(0.12),
-        Some(Tag::Insert) => theme().success.opacity(0.12),
+        Some(Tag::Delete) => crate::palette::danger().opacity(0.12),
+        Some(Tag::Insert) => crate::palette::success().opacity(0.12),
         Some(Tag::Equal) => AdaptiveColor::TRANSPARENT,
         None => theme().muted.opacity(0.35),
     }
 }
 
+fn word_mark(tag: Tag) -> AdaptiveColor {
+    match tag {
+        Tag::Delete => crate::palette::danger().opacity(0.28),
+        Tag::Insert => crate::palette::success().opacity(0.28),
+        Tag::Equal => theme().primary.opacity(0.22),
+    }
+}
+
 fn line_ink(tag: Tag) -> AdaptiveColor {
     match tag {
-        Tag::Delete => theme().danger,
-        Tag::Insert => theme().success,
+        Tag::Delete => crate::palette::danger(),
+        Tag::Insert => crate::palette::success(),
         Tag::Equal => theme().foreground,
     }
 }
@@ -1000,9 +975,8 @@ fn marker(tag: Tag) -> impl IntoElement {
         .text_color(move || line_ink(tag))
 }
 
-/// The line itself. Unchanged runs of a changed line take the line color;
-/// the changed words are semibold and underlined, since a run cannot carry
-/// its own background.
+/// The line itself. Unchanged runs of a changed line take the line color.
+/// A changed word is semibold on its own background.
 fn line_text(spans: Vec<Span>, tag: Tag) -> impl IntoElement {
     let mut line = text("")
         .flex_1()
@@ -1021,7 +995,11 @@ fn line_text(spans: Vec<Span>, tag: Tag) -> impl IntoElement {
             .text_size(px(12.5))
             .text_color(move || line_ink(tag));
         if span.changed {
-            run = run.font_weight(FontWeight::SEMIBOLD).underline();
+            let mark = tag;
+            run = run
+                .font_weight(FontWeight::SEMIBOLD)
+                .rounded(px(2.0))
+                .bg(move || word_mark(mark));
         }
         line = line.child(run);
     }
@@ -1036,7 +1014,7 @@ fn fold_row(hidden: usize) -> impl IntoElement {
         .items_center()
         .justify_center()
         .rounded(px(6.0))
-        .bg(move || theme().list_head)
+        .bg(move || crate::palette::list_head())
         .child(
             text(format!("⋯ {} unchanged", plural(hidden, "line", "lines")))
                 .text_xs()

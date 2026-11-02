@@ -4,10 +4,11 @@ use url_codec_core::{UrlCodecEngine, UrlCodecMode, UrlStructure};
 
 use crate::chrome::{self, column_pane};
 use crate::find::TextSearch;
-use crate::json_model::{self, field_text, window_message, FieldWrite};
+use crate::json_model::{self, window_message};
 use crate::search_ui;
 use crate::url_model::{self, Tone};
-use nsh_core::ui::prelude::*;
+use nsh_base::theme;
+use nsh_core::prelude::*;
 
 pub const SAMPLE: &str = "\
 hello%20world%21
@@ -44,11 +45,11 @@ impl UrlState {
     }
 
     pub fn publish_source(self, text: String) {
-        let shown = field_text(&text);
+        let text = json_model::normalize_newlines(text);
         self.field_origin.set(0);
         self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        self.field_capped.set(false);
+        self.field.set(text.clone());
         self.source.set(text);
         if self.search.open.get() {
             self.schedule_search();
@@ -56,35 +57,15 @@ impl UrlState {
     }
 
     pub fn on_field(self, text: String) {
-        let preview = self.field.get();
-        let origin = self.field_origin.get();
-        let write = self
-            .source
-            .with(|source| json_model::field_write(source, &preview, origin, &text));
-        match write {
-            FieldWrite::Echo => {}
-            FieldWrite::KeepPreview => {
-                self.field.update(|_| {});
-            }
-            FieldWrite::Replace(next) => self.publish_source(next),
-            FieldWrite::Splice(next) => {
-                self.field.set(text);
-                self.source.set(next);
-                if self.search.open.get() {
-                    self.schedule_search();
-                }
-            }
+        if self.source.with(|current| current == &text) {
+            return;
         }
+        self.publish_source(text);
     }
 
     pub fn close_search(self) {
         self.search.open.set(false);
         self.search.snippets.set(Vec::new());
-        let shown = self.source.with(|text| field_text(text));
-        self.field_origin.set(0);
-        self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
     }
 
     pub fn schedule_search(self) {
@@ -111,18 +92,10 @@ impl UrlState {
 
 pub fn body(state: UrlState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
     let header_shortcut = shortcut.clone();
-    let editor = element_ref();
+    let editor = component_ref::<nsh_base::Editor>();
     let query_ref = element_ref();
     search_ui::watch_focus(state.search, query_ref.clone());
-    search_ui::watch_windowed_field(
-        state.search,
-        state.source,
-        state.field,
-        state.field_origin,
-        state.field_line,
-        state.field_capped,
-        editor.clone(),
-    );
+    search_ui::watch_editor(state.search, state.source, editor);
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -186,7 +159,7 @@ fn page_header(state: UrlState, shortcut: String) -> impl IntoElement {
         ))
 }
 
-fn input_pane(state: UrlState, shortcut: String, editor: ElementRef) -> impl IntoElement {
+fn input_pane(state: UrlState, shortcut: String, editor: search_ui::EditorHandle) -> impl IntoElement {
     let source = state.source;
     column_pane()
         .child(header(source))
@@ -194,11 +167,14 @@ fn input_pane(state: UrlState, shortcut: String, editor: ElementRef) -> impl Int
         .child(status_line(state))
         .child(field_note(state))
         .child(
-            chrome::mono_field(state.field, "hello%20world", true, true, move |text| {
-                state.on_field(text);
-            })
-            .element_ref(&editor)
-            .test_id("url-input")
+            chrome::mono_editor(
+                state.source,
+                "hello%20world",
+                true,
+                move || search_ui::editor_query(state.search),
+                move |text| state.on_field(text),
+            )
+            .component_ref(&editor)
                 .flex_1()
                 .min_h(px(120.0)),
         )
@@ -217,7 +193,7 @@ fn field_note(state: UrlState) -> impl IntoElement {
             .child(
                 text(message)
                     .text_xs()
-                    .text_color(move || theme().warning),
+                    .text_color(move || crate::palette::warning()),
             )
             .into_element()
     })
@@ -280,9 +256,9 @@ fn status_line(state: UrlState) -> impl IntoElement {
 fn tone_color(tone: Tone) -> AdaptiveColor {
     match tone {
         Tone::Muted => theme().muted_foreground,
-        Tone::Info => theme().info,
-        Tone::Success => theme().success,
-        Tone::Danger => theme().danger,
+        Tone::Info => crate::palette::info(),
+        Tone::Success => crate::palette::success(),
+        Tone::Danger => crate::palette::danger(),
     }
 }
 
@@ -320,12 +296,12 @@ fn results(state: UrlState, copied: Signal<Option<String>>) -> impl IntoElement 
                 .child(chrome::state_card(
                     "Couldn't convert this input",
                     "See the message under the controls.",
-                    theme().danger,
+                    crate::palette::danger(),
                 ))
                 .child(
                     text(message)
                         .text_xs()
-                        .text_color(move || theme().danger),
+                        .text_color(move || crate::palette::danger()),
                 )
                 .into_element()
         }

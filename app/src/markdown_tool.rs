@@ -10,9 +10,10 @@ use markdown_core::{
 
 use crate::chrome::{self, column_pane};
 use crate::find::{self, TextSearch};
-use crate::json_model::{self, field_text, window_message, FieldWrite, FIELD_LIMIT};
+use crate::json_model::{self, window_message};
 use crate::search_ui;
-use nsh_core::ui::prelude::*;
+use nsh_base::theme;
+use nsh_core::prelude::*;
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -91,11 +92,11 @@ impl MarkdownState {
     }
 
     pub fn publish_source(self, text: String) {
-        let shown = field_text(&text);
+        let text = json_model::normalize_newlines(text);
         self.field_origin.set(0);
         self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        self.field_capped.set(false);
+        self.field.set(text.clone());
         self.source.set(text);
         self.error.set(String::new());
         self.schedule_preview();
@@ -105,44 +106,10 @@ impl MarkdownState {
     }
 
     pub fn on_field(self, text: String) {
-        let preview = self.field.get();
-        let origin = self.field_origin.get();
-        let write = self
-            .source
-            .with(|source| json_model::field_write(source, &preview, origin, &text));
-        match write {
-            FieldWrite::Echo => {}
-            FieldWrite::KeepPreview => {
-                self.field.update(|_| {});
-            }
-            FieldWrite::Replace(next) => {
-                if json_model::utf16_len(&next) + 8 >= FIELD_LIMIT {
-                    self.recover_clipboard(next);
-                } else {
-                    self.publish_source(next);
-                }
-            }
-            FieldWrite::Splice(next) => {
-                self.field.set(text);
-                self.source.set(next);
-                self.schedule_preview();
-                if self.search.open.get() {
-                    self.schedule_search();
-                }
-            }
+        if self.source.with(|current| current == &text) {
+            return;
         }
-    }
-
-    fn recover_clipboard(self, clipped: String) {
-        self.field.set(clipped.clone());
-        spawn(async move {
-            let clip = clipboard_string().await;
-            if clip.len() > clipped.len().saturating_add(8) && clip.starts_with(&clipped) {
-                self.publish_source(clip);
-            } else {
-                self.publish_source(clipped);
-            }
-        });
+        self.publish_source(text);
     }
 
     pub fn schedule_preview(self) {
@@ -192,11 +159,9 @@ impl MarkdownState {
     pub fn close_search(self) {
         self.search.open.set(false);
         self.search.snippets.set(Vec::new());
-        let shown = self.source.with(|text| field_text(text));
         self.field_origin.set(0);
         self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        self.field_capped.set(false);
     }
 
     pub fn paste(self) {
@@ -275,18 +240,10 @@ impl MarkdownState {
 }
 
 pub fn body(state: MarkdownState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
-    let editor = element_ref();
+    let editor = component_ref::<nsh_base::Editor>();
     let query_ref = element_ref();
     search_ui::watch_focus(state.search, query_ref.clone());
-    search_ui::watch_windowed_field(
-        state.search,
-        state.source,
-        state.field,
-        state.field_origin,
-        state.field_line,
-        state.field_capped,
-        editor.clone(),
-    );
+    search_ui::watch_editor(state.search, state.source, editor);
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -356,16 +313,20 @@ fn page_header(state: MarkdownState, copied: Signal<Option<String>>, shortcut: S
         )
 }
 
-fn editor_pane(state: MarkdownState, editor: ElementRef) -> impl IntoElement {
+fn editor_pane(state: MarkdownState, editor: search_ui::EditorHandle) -> impl IntoElement {
+    let search = state.search;
     column_pane()
         .child(editor_header(state))
         .child(field_note(state))
         .child(
-            chrome::mono_field(state.field, "Paste markdown", true, true, move |text| {
-                state.on_field(text);
-            })
-            .element_ref(&editor)
-            .test_id("md-input")
+            chrome::mono_editor(
+                state.source,
+                "Paste markdown",
+                true,
+                move || search_ui::editor_query(search),
+                move |text| state.on_field(text),
+            )
+            .component_ref(&editor)
             .flex_1()
             .min_h(px(160.0)),
         )
@@ -396,7 +357,7 @@ fn field_note(state: MarkdownState) -> impl IntoElement {
                 .child(
                     text(message)
                         .text_xs()
-                        .text_color(move || theme().warning),
+                        .text_color(move || crate::palette::warning()),
                 )
                 .into_element();
         }
@@ -410,7 +371,7 @@ fn field_note(state: MarkdownState) -> impl IntoElement {
             .child(
                 text(message)
                     .text_xs()
-                    .text_color(move || theme().warning),
+                    .text_color(move || crate::palette::warning()),
             )
             .into_element()
     })
@@ -479,7 +440,7 @@ fn preview_header(state: MarkdownState) -> impl IntoElement {
                 .child(
                     text(message)
                         .text_xs()
-                        .text_color(move || theme().warning),
+                        .text_color(move || crate::palette::warning()),
                 )
                 .into_element()
         }))
@@ -609,7 +570,7 @@ fn render_list(ordered: bool, start: u64, items: &[ListItem], depth: u32, ctx: &
                         .text_sm()
                         .text_color(move || {
                             if done {
-                                theme().success
+                                crate::palette::success()
                             } else {
                                 theme().muted_foreground
                             }
@@ -685,7 +646,7 @@ fn table_row(cells: &[Vec<Inline>], aligns: &[Align], head: bool, ctx: &Ctx) -> 
         .border_color(move || theme().border)
         .bg(move || {
             if head {
-                theme().list_head
+                crate::palette::list_head()
             } else {
                 AdaptiveColor::TRANSPARENT
             }
@@ -718,7 +679,7 @@ fn render_footnote(label: &str, blocks: &[Block], ctx: &mut Ctx) -> AnyElement {
         text(format!("[{label}]"))
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(move || theme().info),
+            .text_color(move || crate::palette::info()),
     );
     for block in blocks {
         column = column.child(render_block(block, ctx, 0));
@@ -811,7 +772,7 @@ fn push_inline(node: Text, inline: &Inline, look: Look, link: Option<&str>, ctx:
             text(format!("[{label}]"))
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(move || theme().info),
+                .text_color(move || crate::palette::info()),
         ),
         Inline::Image { alt, url, .. } => node.child(render_image(alt, url, ctx)),
     }
@@ -860,7 +821,7 @@ fn style_span(node: Text, look: Look, link: Option<&str>) -> Text {
     }
     node = node.text_color(move || {
         if linked {
-            theme().info
+            crate::palette::info()
         } else {
             theme().foreground
         }

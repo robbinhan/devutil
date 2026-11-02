@@ -16,9 +16,10 @@ use hash_core::{self, DigestRow};
 use crate::chrome::{self, column_pane};
 use crate::find::TextSearch;
 use crate::hash_model::{self, InputMode, StatusLine, Tone, DEBOUNCE};
-use crate::json_model::{self, field_text, reveal_match};
+use crate::json_model;
 use crate::search_ui;
-use nsh_core::ui::prelude::*;
+use nsh_base::theme;
+use nsh_core::prelude::*;
 
 #[derive(Clone, Copy)]
 pub struct HashState {
@@ -81,11 +82,11 @@ impl HashState {
     }
 
     pub fn publish_source(self, text: String, rehash: bool) {
-        let shown = hash_model::displayed_input(&text);
+        let text = json_model::normalize_newlines(text);
         self.field_origin.set(0);
         self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
+        self.field_capped.set(false);
+        self.field.set(text.clone());
         self.source.set(text);
         if rehash {
             self.schedule_text();
@@ -109,53 +110,14 @@ impl HashState {
     pub fn close_search(self) {
         self.search.open.set(false);
         self.search.snippets.set(Vec::new());
-        let shown = self.source.with(|text| field_text(text));
-        self.field_origin.set(0);
-        self.field_line.set(0);
-        self.field_capped.set(shown.capped);
-        self.field.set(shown.text);
     }
 
-    /// A keystroke in the field. The view never holds more than the preview.
+    /// A keystroke in the editor. The editor holds the whole text.
     pub fn on_field(self, text: String) {
-        if self.field.with(|current| current == &text) {
+        if self.source.with(|current| current == &text) {
             return;
         }
-        let origin = self.field_origin.get();
-        let capped = self.field_capped.get();
-        let preview = self.field.get();
-        if (capped || origin > 0) && is_preview_edit(&preview, &text) {
-            self.field.update(|_| {});
-            return;
-        }
-        if origin == 0 && json_model::utf16_len(&text) + 8 >= json_model::FIELD_LIMIT {
-            self.recover_clipboard(text);
-            return;
-        }
-        if origin == 0 {
-            self.publish_source(text, true);
-            return;
-        }
-        let Some(spliced) = self
-            .source
-            .with(|source| json_model::splice_window(source, origin, preview.len(), &text))
-        else {
-            self.field.update(|_| {});
-            return;
-        };
-        self.publish_source(spliced, true);
-    }
-
-    fn recover_clipboard(self, clipped: String) {
-        self.field.set(clipped.clone());
-        spawn(async move {
-            let clip = clipboard_string().await;
-            if clip.len() > clipped.len().saturating_add(8) && clip.starts_with(&clipped) {
-                self.publish_source(clip, true);
-            } else {
-                self.publish_source(clipped, true);
-            }
-        });
+        self.publish_source(text, true);
     }
 
     pub fn paste(self) {
@@ -419,10 +381,10 @@ fn take_cancel_token() -> Arc<AtomicBool> {
 
 pub fn body(state: HashState, copied: Signal<Option<String>>, shortcut: String) -> impl IntoElement {
     let header_shortcut = shortcut.clone();
-    let editor = element_ref();
+    let editor = component_ref::<nsh_base::Editor>();
     let query_ref = element_ref();
     search_ui::watch_focus(state.search, query_ref.clone());
-    let field_editor = editor.clone();
+    let field_editor = editor;
     effect(move || {
         let revision = state.search.revision.get();
         let _ = state.search.index.get();
@@ -435,13 +397,8 @@ pub fn body(state: HashState, copied: Signal<Option<String>>, shortcut: String) 
                 return;
             };
             let full = state.source.get();
-            let revealed = reveal_match(&full, hit.start, hit.end);
-            state.field_origin.set(revealed.preview.byte_start);
-            state.field_line.set(revealed.line);
-            state.field_capped.set(revealed.preview.capped);
-            state.field.set(revealed.preview.text);
             state.search.publish_snippets(&full);
-            search_ui::select_later(field_editor.clone(), revealed.utf16_start, revealed.utf16_end);
+            search_ui::reveal_in_editor(field_editor, &full, hit.start, hit.end, false);
         });
     });
     view()
@@ -505,23 +462,23 @@ fn page_header(state: HashState, shortcut: String) -> impl IntoElement {
         .child(chrome::action_button("Hash", "hash-run", true, move || state.run()))
 }
 
-fn input_pane(state: HashState, editor: ElementRef) -> impl IntoElement {
+fn input_pane(state: HashState, editor: search_ui::EditorHandle) -> impl IntoElement {
     column_pane()
         .child(header(state))
         .child(mode_row(state))
         .child(option_row(state))
-        .child(If::new(
+        .child(when(
             move || state.hmac.get(),
             move || key_field(state),
         ))
         .child(compare_field(state))
         .child(status_line(state))
         .child(cap_note(state))
-        .child(If::new(
+        .child(when(
             move || state.mode.get() == InputMode::Text,
             move || text_field(state, editor.clone()),
         ))
-        .child(If::new(
+        .child(when(
             move || state.mode.get() == InputMode::File,
             move || file_card(state),
         ))
@@ -584,7 +541,7 @@ fn cap_note(state: HashState) -> impl IntoElement {
             return view().child(
                 text(message)
                     .text_xs()
-                    .text_color(move || theme().warning),
+                    .text_color(move || crate::palette::warning()),
             );
         }
         if state.mode.get() != InputMode::Text || !state.field_capped.get() {
@@ -598,18 +555,26 @@ fn cap_note(state: HashState) -> impl IntoElement {
         view().child(
             text(message)
                 .text_xs()
-                .text_color(move || theme().warning),
+                .text_color(move || crate::palette::warning()),
         )
     })
 }
 
-fn text_field(state: HashState, editor: ElementRef) -> impl IntoElement {
-    let field = state.field;
-    chrome::mono_field(field, hash_model::SAMPLE, true, true, move |text| {
-        state.on_field(text)
-    })
-    .element_ref(&editor)
-    .test_id("hash-input")
+fn text_field(state: HashState, editor: search_ui::EditorHandle) -> impl IntoElement {
+    let search = state.search;
+    chrome::mono_editor(
+        state.source,
+        hash_model::SAMPLE,
+        true,
+        move || {
+            if state.mode.get() != InputMode::Text {
+                return None;
+            }
+            search_ui::editor_query(search)
+        },
+        move |text| state.on_field(text),
+    )
+    .component_ref(&editor)
     .flex_1()
     .min_h(px(120.0))
 }
@@ -842,15 +807,15 @@ fn digest_row(
         .rounded(px(12.0))
         .bg(move || {
             if matched {
-                theme().success.opacity(0.14)
+                crate::palette::success().opacity(0.14)
             } else {
-                theme().group_box
+                theme().card
             }
         })
         .border_1()
         .border_color(move || {
             if matched {
-                theme().success.opacity(0.45)
+                crate::palette::success().opacity(0.45)
             } else {
                 theme().border
             }
@@ -862,12 +827,12 @@ fn digest_row(
                 .items_center()
                 .gap(px(8.0))
                 .child(chrome::chip(label))
-                .child(If::new(
+                .child(when(
                     move || matched,
-                    || chrome::badge("Match", theme().success),
+                    || chrome::badge("Match", crate::palette::success()),
                 ))
                 .child(view().flex_1())
-                .child(If::new(
+                .child(when(
                     move || available,
                     move || {
                         let bytes = bytes.clone();
@@ -898,20 +863,9 @@ fn digest_row(
 fn tone_color(tone: Tone) -> AdaptiveColor {
     match tone {
         Tone::Muted => theme().muted_foreground,
-        Tone::Info => theme().info,
-        Tone::Success => theme().success,
-        Tone::Danger => theme().danger,
+        Tone::Info => crate::palette::info(),
+        Tone::Success => crate::palette::success(),
+        Tone::Danger => crate::palette::danger(),
     }
 }
 
-fn is_preview_edit(preview: &str, incoming: &str) -> bool {
-    if incoming.is_empty() || preview.is_empty() {
-        return false;
-    }
-    let shared = preview
-        .bytes()
-        .zip(incoming.bytes())
-        .take_while(|(left, right)| left == right)
-        .count();
-    shared > preview.len() / 2
-}
